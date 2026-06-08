@@ -213,20 +213,6 @@ def render_markdown(
             )
     A("")
 
-    # --- Methodology note
-    A("## 7. How this draft was assembled")
-    A("")
-    A("- Two manufacturer PDFs and the NEPQA 2025 document were parsed page-by-page.")
-    A("- Structured extraction produced a typed `ProductRecord` per manufacturer doc, with "
-      "every value carrying its source page and a confidence score.")
-    A("- A variant detector classified the relationship between the two records; when "
-      "they describe different product families, a human-in-the-loop step "
-      "selects which family this shipment is about.")
-    A("- The chosen record is mapped against NEPQA Section 1.4 (PV Inverter) to produce "
-      "the coverage matrix above. Items not covered are open requests for the manufacturer.")
-    A("- A critic pass reviews the draft against NEPQA source text and flags low-confidence "
-      "or unsupported claims.")
-    A("")
     return "\n".join(md_lines)
 
 
