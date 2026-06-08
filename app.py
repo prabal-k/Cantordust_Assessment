@@ -55,6 +55,46 @@ st.set_page_config(
     layout="wide",
 )
 
+st.markdown(
+    """
+<style>
+/* Slick node-card look */
+div[data-testid="stVerticalBlockBorderWrapper"] {
+    border-radius: 12px !important;
+    transition: border-color 0.3s ease, box-shadow 0.3s ease;
+}
+/* Pulsing green dot for currently-running header markers */
+.running-dot {
+    display: inline-block;
+    width: 10px; height: 10px;
+    border-radius: 50%;
+    background: #22c55e;
+    box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.7);
+    animation: pulse 1.5s infinite;
+    margin-right: 6px;
+    vertical-align: middle;
+}
+@keyframes pulse {
+    0%   { box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.7); }
+    70%  { box-shadow: 0 0 0 10px rgba(34, 197, 94, 0); }
+    100% { box-shadow: 0 0 0 0 rgba(34, 197, 94, 0); }
+}
+/* Phase subheaders cleaner */
+h3 {
+    border-bottom: 1px solid rgba(148, 163, 184, 0.18);
+    padding-bottom: 4px;
+    margin-top: 28px;
+}
+/* Slight glow on header markdown */
+.node-header {
+    font-weight: 600;
+    font-size: 1.05rem;
+}
+</style>
+    """,
+    unsafe_allow_html=True,
+)
+
 st.title("Nepal Import Compliance Drafter")
 st.caption(
     "Cantordust AI Engineer Assessment — Task 1 · LangGraph + Gemini/Groq · "
@@ -133,26 +173,26 @@ with action:
         st.caption(f"Current phase: `{st.session_state.phase}`")
 
 
-# --- Render phase-one cards (only after pipeline has started) -----------
+# --- Render phase-one cards (only nodes that have already started) ------
 
 if st.session_state.phase != "idle":
-    st.subheader("Phase 1 — Extraction & variant detection")
+    st.subheader("⚡ Phase 1 — Extraction & variant detection")
     phase_one_cards = st.container()
     with phase_one_cards:
+        from src.ui_nodes import PENDING
+
         for node_key in PHASE_ONE_ORDER:
-            render_node_card(node_key)
+            status = st.session_state.node_status.get(node_key, {})
+            if status.get("state", PENDING) != PENDING:
+                render_node_card(node_key)
 
 
 # --- Phase 1 execution (when user clicks Run) ---------------------------
 
 if run_clicked and st.session_state.phase == "idle":
     reset_node_status()
-    # Cards weren't rendered above (idle gate) — render them inline now.
-    st.subheader("Phase 1 — Extraction & variant detection")
+    st.subheader("⚡ Phase 1 — Extraction & variant detection")
     phase_one_cards = st.container()
-    with phase_one_cards:
-        for node_key in PHASE_ONE_ORDER:
-            render_node_card(node_key)
 
     state: dict = {
         "pdf1_path": pdf1_path,
@@ -172,6 +212,12 @@ if run_clicked and st.session_state.phase == "idle":
     try:
         for ev in stream_phase_one(state):
             if ev.type == "node_start":
+                # Lazy-render the card the FIRST time we hear about this node,
+                # so the UI doesn't show empty placeholders for nodes that
+                # haven't started yet.
+                with phase_one_cards:
+                    if ev.node not in st.session_state.placeholders:
+                        render_node_card(ev.node)
                 on_node_start(
                     ev.node,
                     ev.payload.get("desc", ""),
@@ -269,11 +315,16 @@ if st.session_state.phase in ("extracted", "choice_made", "done"):
 # --- Phase 2 execution --------------------------------------------------
 
 if st.session_state.phase in ("choice_made", "done"):
-    st.subheader("Phase 2 — Reconcile · Map · Draft · Critique")
+    st.subheader("🧩 Phase 2 — Reconcile · Map · Draft · Critique")
     phase_two_cards = st.container()
-    with phase_two_cards:
-        for node_key in PHASE_TWO_ORDER:
-            render_node_card(node_key)
+    if st.session_state.phase == "done":
+        from src.ui_nodes import PENDING
+
+        with phase_two_cards:
+            for node_key in PHASE_TWO_ORDER:
+                status = st.session_state.node_status.get(node_key, {})
+                if status.get("state", PENDING) != PENDING:
+                    render_node_card(node_key)
 
 
 if st.session_state.phase == "choice_made":
@@ -281,6 +332,9 @@ if st.session_state.phase == "choice_made":
     try:
         for ev in stream_phase_two(state):
             if ev.type == "node_start":
+                with phase_two_cards:
+                    if ev.node not in st.session_state.placeholders:
+                        render_node_card(ev.node)
                 on_node_start(
                     ev.node,
                     ev.payload.get("desc", ""),

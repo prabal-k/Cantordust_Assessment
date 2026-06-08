@@ -23,10 +23,19 @@ ERROR = "error"
 
 STATE_ICON = {
     PENDING: "·",
-    RUNNING: "⏳",
+    RUNNING: "🟢",
     DONE: "✅",
     SKIPPED: "⚪",
     ERROR: "❌",
+}
+
+
+STATE_COLOR = {
+    PENDING: "#475569",   # slate
+    RUNNING: "#22c55e",   # green-500
+    DONE: "#16a34a",      # green-600
+    SKIPPED: "#94a3b8",   # slate-400
+    ERROR: "#ef4444",     # red-500
 }
 
 
@@ -154,7 +163,9 @@ def on_node_start(
     if retry_attempt is not None and max_retries is not None and retry_attempt > 0:
         suffix = f" — retry {retry_attempt}/{max_retries}"
     ph["header"].markdown(
-        f"{STATE_ICON[RUNNING]} {ph['icon']} **{node_key}**{suffix}"
+        f"<span class='running-dot'></span> {ph['icon']} "
+        f"<span class='node-header'>{node_key}</span>{suffix}",
+        unsafe_allow_html=True,
     )
     ph["desc"].caption(desc)
 
@@ -187,7 +198,11 @@ def on_node_done(node_key: str, summary: str, elapsed: float, *, final_buffer: s
     ph = st.session_state.placeholders.get(node_key)
     if ph is None:
         return
-    ph["header"].markdown(f"{STATE_ICON[DONE]} {ph['icon']} **{node_key}**")
+    ph["header"].markdown(
+        f"{STATE_ICON[DONE]} {ph['icon']} "
+        f"<span class='node-header'>{node_key}</span>",
+        unsafe_allow_html=True,
+    )
     ph["elapsed"].caption(f"{elapsed:.1f}s")
     if ph.get("tokens_preview") is not None and final_buffer:
         ph["tokens_preview"].code(_preview_text(final_buffer), language="json")
