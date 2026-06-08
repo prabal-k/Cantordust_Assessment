@@ -50,7 +50,14 @@ def reset_node_status() -> None:
 
 def render_node_card(node_key: str) -> dict:
     """Create the placeholder containers for one node card. Returns the dict
-    of placeholders so the consumer can update them mid-stream."""
+    of placeholders so the consumer can update them mid-stream.
+
+    For LLM nodes the token stream is shown in two surfaces:
+      - `tokens_preview`: a compact code block capped to the last ~5 lines /
+        400 chars. Always visible while the node is running.
+      - `tokens_full`: full buffer (last 6 KB) inside an `st.expander` that
+        is collapsed by default. The user clicks to drill down.
+    """
     meta = NODE_META[node_key]
     icon = meta["icon"]
     with st.container(border=True):
@@ -60,13 +67,22 @@ def render_node_card(node_key: str) -> dict:
             desc = st.empty()
         with cols[1]:
             elapsed = st.empty()
-        tokens = st.empty() if meta["is_llm"] else None
+        if meta["is_llm"]:
+            tokens_preview = st.empty()
+            with st.expander("Show full stream", expanded=False):
+                tokens_full = st.empty()
+        else:
+            tokens_preview = None
+            tokens_full = None
         summary = st.empty()
     placeholders = {
         "icon": icon,
         "header": header,
         "desc": desc,
-        "tokens": tokens,
+        "tokens_preview": tokens_preview,
+        "tokens_full": tokens_full,
+        # Back-compat alias so old code paths keep working.
+        "tokens": tokens_preview,
         "summary": summary,
         "elapsed": elapsed,
         "is_llm": meta["is_llm"],
@@ -74,6 +90,16 @@ def render_node_card(node_key: str) -> dict:
     _paint_from_status(node_key, placeholders)
     st.session_state.placeholders[node_key] = placeholders
     return placeholders
+
+
+def _preview_text(text: str, max_lines: int = 5, max_chars: int = 400) -> str:
+    """Compact tail of a streaming buffer for the always-visible preview."""
+    if not text:
+        return ""
+    lines = text.splitlines()
+    if len(lines) >= max_lines:
+        return "\n".join(lines[-max_lines:])
+    return text[-max_chars:]
 
 
 def _paint_from_status(node_key: str, ph: dict) -> None:
@@ -86,8 +112,12 @@ def _paint_from_status(node_key: str, ph: dict) -> None:
         ph["desc"].caption(status["desc"])
     if status.get("elapsed") is not None:
         ph["elapsed"].caption(f"{status['elapsed']:.1f}s")
-    if ph["tokens"] is not None and status.get("tokens"):
-        ph["tokens"].code(status["tokens"], language="json")
+    if ph.get("tokens_preview") is not None and status.get("tokens"):
+        ph["tokens_preview"].code(
+            _preview_text(status["tokens"]), language="json"
+        )
+    if ph.get("tokens_full") is not None and status.get("tokens"):
+        ph["tokens_full"].code(status["tokens"][-6000:], language="json")
     if status.get("summary"):
         if state == ERROR:
             ph["summary"].error(status["summary"])
@@ -130,8 +160,8 @@ def on_node_start(
 
 
 def on_node_token(node_key: str, text: str, *, throttle_chars: int = 80) -> None:
-    """Accumulate token text; repaint only every `throttle_chars` chars to keep
-    the browser snappy."""
+    """Accumulate token text; repaint preview + full surfaces every
+    `throttle_chars` chars to keep the browser snappy."""
     status = st.session_state.node_status[node_key]
     prev_len = len(status.get("tokens", ""))
     status["tokens"] = status.get("tokens", "") + text
@@ -139,11 +169,12 @@ def on_node_token(node_key: str, text: str, *, throttle_chars: int = 80) -> None
     if new_len // throttle_chars == prev_len // throttle_chars:
         return
     ph = st.session_state.placeholders.get(node_key)
-    if ph is None or ph["tokens"] is None:
+    if ph is None or ph.get("tokens_preview") is None:
         return
-    # Trim very long buffers to last ~6 KB so the browser doesn't choke.
-    display = status["tokens"][-6000:]
-    ph["tokens"].code(display, language="json")
+    full = status["tokens"]
+    ph["tokens_preview"].code(_preview_text(full), language="json")
+    if ph.get("tokens_full") is not None:
+        ph["tokens_full"].code(full[-6000:], language="json")
 
 
 def on_node_done(node_key: str, summary: str, elapsed: float, *, final_buffer: str = "") -> None:
@@ -158,8 +189,10 @@ def on_node_done(node_key: str, summary: str, elapsed: float, *, final_buffer: s
         return
     ph["header"].markdown(f"{STATE_ICON[DONE]} {ph['icon']} **{node_key}**")
     ph["elapsed"].caption(f"{elapsed:.1f}s")
-    if ph["tokens"] is not None and final_buffer:
-        ph["tokens"].code(final_buffer[-6000:], language="json")
+    if ph.get("tokens_preview") is not None and final_buffer:
+        ph["tokens_preview"].code(_preview_text(final_buffer), language="json")
+    if ph.get("tokens_full") is not None and final_buffer:
+        ph["tokens_full"].code(final_buffer[-6000:], language="json")
     ph["summary"].success(summary)
 
 
