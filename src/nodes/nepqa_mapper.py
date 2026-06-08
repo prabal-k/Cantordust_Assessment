@@ -50,7 +50,7 @@ TECH_KEYWORDS = {
 # Evidence with FieldClaim.confidence below this threshold gets demoted from
 # COVERED → PARTIAL. Keyword match alone is not enough; the LLM must have
 # extracted the value confidently.
-CONFIDENCE_FLOOR_FOR_COVERED = 0.80
+CONFIDENCE_FLOOR_FOR_COVERED = 0.70
 
 
 def _max_conf(claims: list[FieldClaim]) -> float:
@@ -96,14 +96,14 @@ def _check_document_item(item: NEPQAItem, record: ProductRecord) -> CoverageResu
 
     if matches:
         # Demote to PARTIAL if best evidence confidence is low.
-        if _max_conf(matches) < 0.80:
+        if _max_conf(matches) < CONFIDENCE_FLOOR_FOR_COVERED:
             return CoverageResult(
                 item=item,
                 status=CoverageStatus.PARTIAL,
                 evidence=matches,
                 gap_note=(
                     f"Standard match confidence {_max_conf(matches):.2f} below "
-                    "0.80 threshold; verify cert against the source PDF."
+                    f"{CONFIDENCE_FLOOR_FOR_COVERED:.2f} threshold; verify cert against the source PDF."
                 ),
             )
         return CoverageResult(item=item, status=CoverageStatus.COVERED, evidence=matches)
