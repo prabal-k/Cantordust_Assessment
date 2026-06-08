@@ -47,6 +47,16 @@ TECH_KEYWORDS = {
 }
 
 
+# Evidence with FieldClaim.confidence below this threshold gets demoted from
+# COVERED → PARTIAL. Keyword match alone is not enough; the LLM must have
+# extracted the value confidently.
+CONFIDENCE_FLOOR_FOR_COVERED = 0.80
+
+
+def _max_conf(claims: list[FieldClaim]) -> float:
+    return max((c.confidence for c in claims), default=0.0)
+
+
 def _resolve(record: ProductRecord, dotted: str) -> Optional[FieldClaim]:
     obj = record
     for part in dotted.split("."):
@@ -85,6 +95,17 @@ def _check_document_item(item: NEPQAItem, record: ProductRecord) -> CoverageResu
             matches.append(std)
 
     if matches:
+        # Demote to PARTIAL if best evidence confidence is low.
+        if _max_conf(matches) < 0.80:
+            return CoverageResult(
+                item=item,
+                status=CoverageStatus.PARTIAL,
+                evidence=matches,
+                gap_note=(
+                    f"Standard match confidence {_max_conf(matches):.2f} below "
+                    "0.80 threshold; verify cert against the source PDF."
+                ),
+            )
         return CoverageResult(item=item, status=CoverageStatus.COVERED, evidence=matches)
     return CoverageResult(
         item=item,
@@ -113,21 +134,56 @@ def _check_technical_item(item: NEPQAItem, record: ProductRecord) -> CoverageRes
             status=CoverageStatus.MISSING,
             gap_note=f"Value for {matched_attr} not present in extracted record. Ask factory.",
         )
+    # Demote to PARTIAL if evidence confidence is low — keyword match alone is
+    # not enough to claim COVERED.
+    if fc.confidence < CONFIDENCE_FLOOR_FOR_COVERED:
+        return CoverageResult(
+            item=item,
+            status=CoverageStatus.PARTIAL,
+            evidence=[fc],
+            gap_note=(
+                f"Evidence found but confidence {fc.confidence:.2f} below "
+                f"{CONFIDENCE_FLOOR_FOR_COVERED} threshold; manual review needed."
+            ),
+        )
     return CoverageResult(item=item, status=CoverageStatus.COVERED, evidence=[fc])
 
 
 def _check_label_item(item: NEPQAItem, record: ProductRecord) -> CoverageResult:
+    """Label-content requirements need a nameplate photo to be honestly covered.
+
+    Token-overlap matches against table headers in the certificate are too weak
+    to mark COVERED — the certificate is not the nameplate. We always report
+    PARTIAL with a "request nameplate photo" gap note when token matches exist,
+    MISSING otherwise.
+    """
     req_text = (item.requirement_text or "").lower()
     matches: list[FieldClaim] = []
     for lbl in record.labeling_items:
         if not isinstance(lbl.value, str):
             continue
-        # split on common separators and check overlap
         tokens = [t for t in re.split(r"[\s,;:/]+", req_text) if len(t) > 3]
         if any(t in lbl.value.lower() for t in tokens):
             matches.append(lbl)
+
+    high_conf_matches = [m for m in matches if m.confidence >= CONFIDENCE_FLOOR_FOR_COVERED]
+
+    if high_conf_matches:
+        return CoverageResult(
+            item=item,
+            status=CoverageStatus.COVERED,
+            evidence=high_conf_matches,
+        )
     if matches:
-        return CoverageResult(item=item, status=CoverageStatus.COVERED, evidence=matches)
+        return CoverageResult(
+            item=item,
+            status=CoverageStatus.PARTIAL,
+            evidence=matches,
+            gap_note=(
+                "Weak match against certificate text; cannot confirm without a "
+                "nameplate photo from the factory."
+            ),
+        )
     return CoverageResult(
         item=item,
         status=CoverageStatus.PARTIAL,
