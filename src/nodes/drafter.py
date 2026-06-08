@@ -62,12 +62,56 @@ def _severity_tag(sev: MismatchSeverity) -> str:
     }[sev]
 
 
+def _scalar_value(record: Optional[ProductRecord], dotted: str) -> Optional[str]:
+    """Resolve a dotted path on a record and return the FieldClaim value as str."""
+    if record is None:
+        return None
+    obj: object = record
+    for part in dotted.split("."):
+        obj = getattr(obj, part, None)
+        if obj is None:
+            return None
+    val = getattr(obj, "value", None)
+    return str(val) if val is not None else None
+
+
+_AGREEMENT_PATHS: list[tuple[str, str]] = [
+    ("Factory", "factory"),
+    ("Topology", "mechanical.topology"),
+    ("Power factor", "electrical.power_factor"),
+    ("Cooling", "mechanical.cooling"),
+    ("Operating temp", "mechanical.operating_temp_range_c"),
+    ("Protective class", "mechanical.protective_class"),
+    ("AC frequency", "electrical.ac_frequency_hz"),
+]
+
+
+def _collect_agreements(
+    p1: Optional[ProductRecord], p2: Optional[ProductRecord]
+) -> list[tuple[str, str]]:
+    """Return rows where both records have the SAME normalized value for a
+    given field."""
+    if p1 is None or p2 is None:
+        return []
+    rows: list[tuple[str, str]] = []
+    for label, dotted in _AGREEMENT_PATHS:
+        v1 = _scalar_value(p1, dotted)
+        v2 = _scalar_value(p2, dotted)
+        if v1 is None or v2 is None:
+            continue
+        if v1.strip().lower() == v2.strip().lower():
+            rows.append((label, v1))
+    return rows
+
+
 def render_markdown(
     chosen: ProductRecord,
     decision: Optional[VariantDecision],
     mismatches: list[MismatchEntry],
     coverage: list[CoverageResult],
     timestamp: str,
+    p1: Optional[ProductRecord] = None,
+    p2: Optional[ProductRecord] = None,
 ) -> str:
     e, m = chosen.electrical, chosen.mechanical
 
@@ -146,6 +190,34 @@ def render_markdown(
         A("_no model numbers extracted_")
     A("")
 
+    # --- Variant breakdown (auto-grouped by SKU suffix patterns)
+    if chosen.model_numbers:
+        groups: dict[str, list[str]] = {}
+        for fc in chosen.model_numbers:
+            if not isinstance(fc.value, str):
+                continue
+            sku = fc.value.strip()
+            # Heuristic: variant = the bit after the last `-` if it looks like
+            # a short tag (e.g. "AM2", "AM2-P1", "EU"). Otherwise the SKU goes
+            # into a "base" bucket.
+            parts = sku.split("-")
+            tag = parts[-1] if parts and len(parts[-1]) <= 4 else "base"
+            groups.setdefault(tag, []).append(sku)
+        if len(groups) > 1:
+            A("### Variant breakdown")
+            A("")
+            A("The model SKUs cluster into the following variants. Differences "
+              "between variants (e.g. max input current, max short-circuit "
+              "current) should be confirmed against the certificate appendix.")
+            A("")
+            A("| Variant suffix | Count | Example SKUs |")
+            A("|---|---|---|")
+            for tag in sorted(groups):
+                skus = groups[tag]
+                example = ", ".join(skus[:3]) + (f" … (+{len(skus) - 3} more)" if len(skus) > 3 else "")
+                A(f"| `{tag}` | {len(skus)} | {example} |")
+            A("")
+
     # --- Certifications
     A("## 3. Certifications & test reports")
     A("")
@@ -196,8 +268,27 @@ def render_markdown(
         )
     A("")
 
-    # --- Mismatches
+    # --- Mismatches + agreements
     A("## 6. Cross-source consistency report")
+    A("")
+
+    agreements = _collect_agreements(p1, p2)
+    if agreements:
+        A("### Consistent across both source documents")
+        A("")
+        A("| Field | Value (same in both) |")
+        A("|---|---|")
+        for label, value in agreements:
+            A(f"| {label} | **{value}** |")
+        A("")
+    else:
+        A("### Consistent across both source documents")
+        A("")
+        A("_no exact agreements detected on scalar fields — the two PDFs cover "
+          "different product families, so divergence is expected._")
+        A("")
+
+    A("### Differences")
     A("")
     if not mismatches:
         A("_no mismatches detected_")
@@ -233,7 +324,15 @@ def drafter_node(state: AgentState) -> AgentState:
         }
     )
 
-    md_text = render_markdown(chosen, decision, mismatches, coverage, timestamp)
+    md_text = render_markdown(
+        chosen,
+        decision,
+        mismatches,
+        coverage,
+        timestamp,
+        p1=state.get("pdf1_record"),
+        p2=state.get("pdf2_record"),
+    )
 
     safe_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_md = OUTPUTS_DIR / f"compliance_draft_{safe_ts}.md"
