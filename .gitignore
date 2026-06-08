@@ -1,0 +1,27 @@
+.venv/
+venv/
+env/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.env
+.env.local
+*.egg-info/
+dist/
+build/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+outputs/*
+!outputs/.gitkeep
+outputs/cache/
+outputs/debug/
+.coverage
+htmlcov/
+
+# docs/: private notes; only the graph.png is shared in the repo
+docs/*
+!docs/graph.png
+

@@ -1,0 +1,122 @@
+# Nepal Import Compliance Drafter
+
+A small agent that reads two messy factory PDFs and Nepal's solar regulator checklist, then writes a draft compliance file the importer's customs agent can actually review.
+
+Built as my Task 1 submission for Cantordust's AI Engineer take-home.
+
+## The problem in one paragraph
+
+A Kathmandu trader called SunBridge wants to import grid-tied solar inverters from China. The factory sends some paperwork, but it's written for China — different layouts, different terminology, sometimes for two different products mixed together. Nepal expects the inverter to be tested to a specific NEPQA 2025 checklist. Someone has to sit down, read everything, line it up against Nepal's rules, and produce one clean draft to hand to the import agent. That's tedious and easy to get wrong by hand. So I wrote an agent to do it.
+
+The interesting twist (which I'm pretty sure is the trap Cantordust set on purpose): the two factory PDFs they handed me describe **two different products** from the same factory in Ningbo. PDF1 is a small single-phase Chisage microinverter line. PDF2 is the big three-phase Deye string-inverter line. Merging facts from both into one draft would be wrong and the import agent would catch it. So the agent has to detect the mismatch, ask which product the shipment is actually about, and only then write the draft.
+
+## What it does
+
+- Reads the three PDFs (`PyMuPDF`, page-indexed)
+- Extracts a typed `ProductRecord` from each manufacturer doc using an LLM + Pydantic schema
+- Pulls the NEPQA Section 1.4 (PV Inverter) checklist out of the regulator PDF the same way
+- A **ReAct agent** classifies the relationship between the two records using 4 read-only tools and a terminal `commit_decision` tool
+- If the records describe different families, the user picks which one the shipment is about (CLI prompt, or Streamlit radio)
+- Reconciles the two records field-by-field, maps the chosen one to NEPQA, drafts the final markdown + PDF
+- A critic node re-reads the draft and flags anything unsupported; if it finds flags, a `patch_extractor` node re-extracts only the flagged fields and the loop runs again (configurable retry budget, default 2)
+- Every value in the final draft cites its source PDF and page
+
+## Architecture
+
+![graph](docs/graph.png)
+
+5 of the 11 nodes do LLM work. The other 6 (reconciler, mapper, drafter, render, the routers) are deterministic Python. The hot path that produces the final draft is mostly Python so it's testable and can't hallucinate.
+
+The variant detector wraps an LLM call but also runs a hard Python sanity check on the output: if the two records have disjoint model sets AND different family labels AND different phases, it forces a `DIFFERENT_FAMILY` verdict regardless of what the LLM said. Belt + suspenders.
+
+## Setup
+
+Python 3.11 or higher.
+
+```powershell
+git clone <this-repo>
+cd Cantordust_Assessment
+
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+
+Copy-Item .env.example .env
+# Open .env, paste your GEMINI_API_KEY (free at https://aistudio.google.com/apikey)
+# OR set LLM_PROVIDER=groq and paste GROQ_API_KEY (also free)
+```
+
+If `pip install` chokes on WeasyPrint on Windows, just comment that line out — the agent will skip PDF rendering and still write the markdown draft. WeasyPrint needs the GTK3 runtime on Windows which is more pain than it's worth for a demo.
+
+### Optional: LangSmith tracing
+
+If you want to inspect every LLM call after a run:
+
+1. Make an account at https://smith.langchain.com, grab an API key
+2. In `.env`, uncomment the three `LANGCHAIN_*` lines and fill in the key
+3. Restart Streamlit — the sidebar caption will flip to **🔵 LangSmith tracing ON**
+
+Disabled by default, so a reviewer without a LangSmith account isn't affected.
+
+## Running it
+
+CLI:
+
+```powershell
+python run.py `
+  --pdf1 data/DSS_GZES230100125901_combined-1.pdf `
+  --pdf2 data/188_1115.pdf `
+  --nepqa data/nepqa_2025.pdf `
+  --retries 2
+```
+
+Streamlit:
+
+```powershell
+streamlit run app.py
+```
+
+Both write into `outputs/`:
+
+- `compliance_draft_<timestamp>.md` — the actual draft
+- `compliance_draft_<timestamp>.pdf` — the rendered PDF if WeasyPrint is installed
+- `agent_state_<timestamp>.json` — full state dump for audit
+
+The Streamlit version is the one to demo. It streams tokens live into each node card, shows the variant decision, asks for human input only when needed, and shows the critic's retry loop play out.
+
+## Tests
+
+```powershell
+pytest tests/
+```
+
+There are 18 tests covering schemas, reconciler severity logic, NEPQA coverage classification, the patch-extractor retry counter, all five variant-detector tools, the ReAct agent's commit path, and the fallback path when the agent fails to commit.
+
+## A few decisions worth flagging
+
+- **`FieldClaim` everywhere.** Every extracted value wears a `(value, source_doc, source_page, confidence)` jacket. The drafter only renders these as citations — it never paraphrases them or stamps in a citation that wasn't there. A wrong page number in the draft is immediately obvious.
+- **Two ProductRecords, not one merged record.** The PDFs are for different products. Forcing them into a single record would lose information and create false agreements.
+- **Self-correcting critic loop.** The critic isn't just a flag-printer. When it finds problems, a `patch_extractor` node re-extracts only the flagged fields and the loop reruns up to N times. A best-attempt safeguard keeps the lowest-flag-count draft in case a later iteration regresses.
+- **ReAct variant detector.** I started with a single-shot LLM call here, then upgraded to a `create_react_agent` with explicit tools — partly because it's a more honest answer to "how should the system reason about two records" and partly because the assessment is for a Generative AI & Agentic Systems role and I wanted at least one node that visibly thinks step-by-step.
+- **No vector store.** The total useful page count across all three docs is ~14 pages (with targeted slicing). RAG would be overkill — slicing is faster, cheaper, and traceable.
+
+## Things I deliberately left out
+
+- OCR fallback for scanned PDFs. All three input PDFs have real text; I checked.
+- Coverage for NEPQA sections other than 1.4 (modules, batteries, charge controllers, etc). Out of scope for an inverter shipment.
+- Per-model coverage. The Deye certificate covers 20 SKUs; I treat them as one family.
+- A real database for the IEC standards registry, which could let the agent validate cert numbers against a third source. Would be a nice MCP server.
+
+## Demo
+
+Loom: _added after recording_
+
+## Form answers
+
+The Cantordust submission form answers are below — pasted here so they're versioned with the code.
+
+**Task**: Task 1 (China → Nepal)
+
+**Why this task**: It's the richer agentic surface. Two PDFs to reconcile, an explicit honest-mismatch problem to handle, and a real regulatory checklist to map against. Task 2 is mostly gap-marking with sparse inputs — interesting but it gives less to show.
+
+**Challenges and design choices**: The biggest one was that the two PDFs describe different product families from the same factory. A naive merge would have been wrong and the import agent would have caught it. I added a variant detector + human-in-loop step + a hard Python sanity override on top of the LLM verdict, so the agent surfaces the mismatch instead of hiding it. Provenance was the second big call — every value wraps in a FieldClaim with source doc, page, and confidence, and the drafter stamps those into every line of the final markdown. The third was the LLM/Python split: LLMs handle extraction, classification, and prose review; deterministic Python handles reconciliation, coverage mapping, drafting, and rendering. The Python core is unit-tested. After the base pipeline worked I added three agentic upgrades — a self-correcting critic loop, a ReAct variant detector with explicit tools, and optional LangSmith tracing — so the system genuinely reasons step-by-step at the variant decision and self-corrects when the critic finds problems. None of this was for show: each addition fixes a real failure mode I saw in earlier runs.
