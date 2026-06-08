@@ -8,6 +8,8 @@ from src.prompts import PRODUCT_EXTRACTION_SYSTEM, product_extraction_user
 from src.schemas import ProductRecord
 from src.state import AgentState
 
+from .extract_utils import normalize_record
+
 
 def extract_pdf1_node(state: AgentState) -> AgentState:
     sliced = slice_pages(state["pdf1_pages"], PDF1_USEFUL_PAGES)
@@ -16,7 +18,5 @@ def extract_pdf1_node(state: AgentState) -> AgentState:
         PRODUCT_EXTRACTION_SYSTEM,
         product_extraction_user("pdf1", sliced),
     )
-    # Guarantee the source_doc is correct even if the LLM strays.
-    if record.source_doc != "pdf1":
-        record = record.model_copy(update={"source_doc": "pdf1"})
+    record = normalize_record(record, expected_source="pdf1")
     return {"pdf1_record": record}
