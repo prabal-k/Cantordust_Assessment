@@ -559,6 +559,12 @@ def render_markdown(
       "conf 0.XX)` citation. The agent never silently merges conflicting "
       "facts — mismatches go to §6, not into the product spec tables.")
     A("")
+    A("**Final draft location**: this file is the FINAL output of the run. "
+      "It is also written to `outputs/compliance_draft_for_human_agent.md` "
+      "and `outputs/compliance_draft_for_human_agent.pdf` (stable filenames "
+      "that always reflect the latest run) so the customs agent always knows "
+      "where to look.")
+    A("")
     A("**What was NOT verified by this draft**:")
     A("")
     A("- No physical inspection of the product or factory.")
@@ -633,6 +639,15 @@ def drafter_node(state: AgentState) -> AgentState:
     out_pdf = OUTPUTS_DIR / f"compliance_draft_{safe_ts}.pdf"
     save_markdown(md_text, out_md)
     pdf_ok = markdown_to_pdf(md_text, out_pdf)
+
+    # Stable-named copy: always overwritten so the latest run is findable at
+    # a predictable path. Reviewers and the customs agent look here for the
+    # FINAL draft, regardless of timestamp.
+    final_md = OUTPUTS_DIR / "compliance_draft_for_human_agent.md"
+    final_pdf = OUTPUTS_DIR / "compliance_draft_for_human_agent.pdf"
+    save_markdown(md_text, final_md)
+    if pdf_ok:
+        markdown_to_pdf(md_text, final_pdf)
 
     out_state = OUTPUTS_DIR / f"agent_state_{safe_ts}.json"
     state_dump = {

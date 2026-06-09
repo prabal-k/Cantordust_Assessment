@@ -241,6 +241,9 @@ if run_clicked and st.session_state.phase == "idle":
                 )
             elif ev.type == "node_skipped":
                 on_node_skipped(ev.node, ev.payload.get("reason", ""))
+            elif ev.type == "info":
+                with phase_one_cards:
+                    st.info(ev.payload.get("summary", ev.node))
             elif ev.type == "error":
                 on_node_error(ev.node, ev.payload.get("exc", "unknown error"))
             elif ev.type == "phase_done":
@@ -356,6 +359,9 @@ if st.session_state.phase == "choice_made":
                     elapsed=ev.payload.get("elapsed", 0.0),
                     final_buffer=ev.payload.get("buffer", ""),
                 )
+            elif ev.type == "info":
+                with phase_two_cards:
+                    st.info(ev.payload.get("summary", ev.node))
             elif ev.type == "error":
                 on_node_error(ev.node, ev.payload.get("exc", "unknown error"))
             elif ev.type == "phase_done":

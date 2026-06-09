@@ -1,6 +1,6 @@
 # Nepal Import Compliance Drafter
 
-A small agent that reads two messy factory PDFs and Nepal's solar regulator checklist, then writes a draft compliance file the importer's customs agent can actually review.
+A agent that reads two messy factory PDFs and Nepal's solar regulator checklist, then writes a draft compliance file the importer's customs agent can actually review.
 
 Built as my Task 1 submission for Cantordust's AI Engineer take-home.
 
@@ -8,7 +8,7 @@ Built as my Task 1 submission for Cantordust's AI Engineer take-home.
 
 A Kathmandu trader called SunBridge wants to import grid-tied solar inverters from China. The factory sends some paperwork, but it's written for China — different layouts, different terminology, sometimes for two different products mixed together. Nepal expects the inverter to be tested to a specific NEPQA 2025 checklist. Someone has to sit down, read everything, line it up against Nepal's rules, and produce one clean draft to hand to the import agent. That's tedious and easy to get wrong by hand. So I wrote an agent to do it.
 
-The interesting twist (which I'm pretty sure is the trap Cantordust set on purpose): the two factory PDFs they handed me describe **two different products** from the same factory in Ningbo. PDF1 is a small single-phase Chisage microinverter line. PDF2 is the big three-phase Deye string-inverter line. Merging facts from both into one draft would be wrong and the import agent would catch it. So the agent has to detect the mismatch, ask which product the shipment is actually about, and only then write the draft.
+The interesting twist, the two factory PDFs describe **two different products** from the same factory in Ningbo. PDF1 is a small single-phase Chisage microinverter line. PDF2 is the big three-phase Deye string-inverter line. Merging facts from both into one draft would be wrong and the import agent would catch it. So the agent has to detect the mismatch, ask which product the shipment is actually about, and only then write the draft.
 
 ## What it does
 
@@ -25,11 +25,9 @@ The interesting twist (which I'm pretty sure is the trap Cantordust set on purpo
 
 ![graph](docs/graph.png)
 
-8 of the 13 registered nodes do LLM work. The other 5 (reconciler, mapper, the routers, load_pdfs) are deterministic Python. The drafter is hybrid: a Python markdown template carries every fact + (source: pdfN p.K) citation, and a small LLM call adds four short prose blocks (cover note to the import agent, methodology note, gap narrative, mismatch framing). The prose call is constrained — temperature 0, structured output, post-call guard that rejects any numeric value not present in the structured input — so the LLM can phrase but cannot fabricate. If the guard fires twice in a row, the drafter falls back to canned cover/methodology text and the deterministic core still ships.
+The system is a multi-agent LangGraph workflow with 8 LLM-driven agents and 5 deterministic glue nodes. Three **extraction agents** read each PDF independently and return Pydantic records where every field cites its source page. A **ReAct variant-detector agent** then reasons over both records using five tools and either commits a verdict on its own or hands off to a **human-in-the-loop node** when it is uncertain or when a Python sanity check overrides it.
 
-The drafter runs twice per pipeline. The first call renders the draft for the critic to review. After the critic loop terminates, a `drafter_final` node re-runs the drafter (same function, same deterministic filename) to pick up the critic's ask-the-factory list and surface it in §8 of the draft. The two passes overwrite the same `compliance_draft_<ts>.md` / `.pdf` / `agent_state_<ts>.json` so the final files on disk are always the post-critic versions.
-
-The variant detector wraps an LLM call but also runs a hard Python sanity check on the output: if the two records have disjoint model sets AND different family labels AND different phases, it forces a `DIFFERENT_FAMILY` verdict regardless of what the LLM said. Belt + suspenders.
+A **hybrid drafter agent** writes the compliance file — numeric tables and citations from a deterministic template, four short prose blocks (cover note, methodology, gap narrative, mismatch framing) from a constrained LLM call (temperature 0, structured output, post-call guard that rejects fabricated numbers). A **critic agent** then re-reads the draft against NEPQA source pages and flags anything unsupported, a **patch-extractor agent** re-extracts only the flagged fields, and the drafter runs again — up to `max_retries` cycles, with a best-attempt safeguard so a later iteration cannot regress the final draft. A final drafter pass after the loop ensures the critic's ask-the-factory list lands in §8 of the file on disk.
 
 ## Setup
 
@@ -94,6 +92,34 @@ pytest tests/
 
 There are 42 tests covering schemas, reconciler severity logic, NEPQA coverage classification, the patch-extractor retry counter, all five variant-detector tools, the ReAct agent's commit path and fallback, the hybrid drafter's prose injection + digit-leak guard (rejection of fabricated numbers + fallback to empty prose), and the submission-grade template structure (10 sections, doc-control header, ask-factory §8, sign-off block, NEPQA-as-indicative-reference disclaimer).
 
+## Sample report output
+
+A complete sample run is committed to the repo so a reviewer can read the
+final draft without needing API keys or executing the pipeline.
+
+### Final draft (the file the customs agent reads)
+
+The drafter writes a stable-named copy on every run. Whatever the latest
+pipeline produced, the canonical "final draft" is always at this path:
+
+- **[`outputs/compliance_draft_for_human_agent.pdf`](outputs/compliance_draft_for_human_agent.pdf)** — final PDF, ready to share with the Nepal import agent
+- [`outputs/compliance_draft_for_human_agent.md`](outputs/compliance_draft_for_human_agent.md) — markdown source
+
+### Timestamped sample (preserved for the reviewer)
+
+A single representative run is also kept at a timestamp-free name so you can
+compare it against a fresh run:
+
+- [`outputs/compliance_draft_sample.md`](outputs/compliance_draft_sample.md)
+- [`outputs/compliance_draft_sample.pdf`](outputs/compliance_draft_sample.pdf)
+
+The sample shows the full 10-section structure: doc-control header, cover note,
+how-this-was-assembled, product + variant identification, manufacturer + factory,
+specifications, certifications, labeling, cross-source consistency (with the
+critical microinverter vs string-inverter mismatch surfaced honestly), the NEPQA
+2025 coverage matrix, the ask-the-factory list in §8, and the drafter
+limitations + sign-off block.
+
 ## Demo
 
-Loom: _added after recording_
+Video walkthrough

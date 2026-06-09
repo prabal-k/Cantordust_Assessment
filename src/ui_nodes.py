@@ -178,6 +178,8 @@ def on_node_start(
     retry_attempt: int | None = None,
     max_retries: int | None = None,
 ) -> None:
+    if node_key not in st.session_state.node_status:
+        return
     status = st.session_state.node_status[node_key]
     status["state"] = RUNNING
     status["desc"] = desc
@@ -201,6 +203,8 @@ def on_node_start(
 
 def on_node_token(node_key: str, text: str, *, throttle_chars: int = 80) -> None:
     """Append text to the buffer; repaint every `throttle_chars` chars."""
+    if node_key not in st.session_state.node_status:
+        return
     status = st.session_state.node_status[node_key]
     prev_len = len(status.get("tokens", ""))
     status["tokens"] = status.get("tokens", "") + text
@@ -217,6 +221,8 @@ def on_node_token(node_key: str, text: str, *, throttle_chars: int = 80) -> None
 
 
 def on_node_done(node_key: str, summary: str, elapsed: float, *, final_buffer: str = "") -> None:
+    if node_key not in st.session_state.node_status:
+        return
     status = st.session_state.node_status[node_key]
     status["state"] = DONE
     status["summary"] = summary
@@ -251,6 +257,8 @@ def on_node_done(node_key: str, summary: str, elapsed: float, *, final_buffer: s
 
 
 def on_node_error(node_key: str, exc_repr: str) -> None:
+    if node_key not in st.session_state.node_status:
+        return
     status = st.session_state.node_status[node_key]
     status["state"] = ERROR
     status["summary"] = exc_repr
@@ -262,6 +270,8 @@ def on_node_error(node_key: str, exc_repr: str) -> None:
 
 
 def on_node_skipped(node_key: str, reason: str = "") -> None:
+    if node_key not in st.session_state.node_status:
+        return
     status = st.session_state.node_status[node_key]
     status["state"] = SKIPPED
     status["summary"] = reason or "skipped"

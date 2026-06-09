@@ -16,6 +16,10 @@ build/
 Thumbs.db
 outputs/*
 !outputs/.gitkeep
+!outputs/compliance_draft_sample.md
+!outputs/compliance_draft_sample.pdf
+!outputs/compliance_draft_for_human_agent.md
+!outputs/compliance_draft_for_human_agent.pdf
 outputs/cache/
 outputs/debug/
 .coverage

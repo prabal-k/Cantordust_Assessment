@@ -451,14 +451,13 @@ def stream_phase_two(state: dict) -> Iterator[Event]:
     if best["flag_count"] < final_flag_count:
         _restore_attempt(state, best)
         yield Event(
-            "node_done",
+            "info",
             "best_attempt_restored",
             {
                 "summary": (
                     f"Restored best attempt ({best['flag_count']} flags) "
                     f"after later iteration regressed to {final_flag_count} flags."
                 ),
-                "elapsed": 0.0,
             },
         )
 
