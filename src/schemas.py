@@ -1,7 +1,6 @@
-"""Pydantic v2 contracts. Every value extracted from a PDF wears a FieldClaim
-(value + source_doc + source_page + confidence) so the final draft can cite
-provenance for every claim.
-"""
+"""Pydantic v2 contracts. Every extracted value is a FieldClaim (value +
+source_doc + source_page + confidence) so every claim in the draft carries
+its own citation."""
 from __future__ import annotations
 
 from enum import Enum
@@ -14,13 +13,9 @@ SourceDoc = Literal["pdf1", "pdf2", "nepqa"]
 
 
 class FieldClaim(BaseModel):
-    """Atomic typed fact with provenance.
-
-    `value` is a string so the schema is Gemini-compatible (Gemini's function-
-    calling Schema proto rejects JSON Schema `anyOf`). Numeric / boolean values
-    are stringified by the LLM; downstream code already renders them as text in
-    citations, so no information is lost.
-    """
+    """Atomic typed fact with provenance. `value` is str-typed so Gemini's
+    Schema proto (which rejects `anyOf`) accepts it; numerics are stringified
+    by the LLM and rendered as text in citations downstream."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -70,8 +65,6 @@ class Certification(BaseModel):
 
 
 class ProductRecord(BaseModel):
-    """One per source PDF. Family label decides downstream routing."""
-
     model_config = ConfigDict(extra="forbid")
 
     family_label: str = Field(
@@ -93,9 +86,7 @@ class ProductRecord(BaseModel):
 
 
 class NEPQAItemType(str, Enum):
-    # Enum VALUES are UPPERCASE because Llama 3.3 (via Groq) emits enum NAMES
-    # (uppercase) when filling tool-call arguments. Matching values to names
-    # keeps Groq's strict tool validator happy. Gemini accepts either case.
+    # Uppercase values match Groq's Llama-3.3 tool-call enum naming.
     DOCUMENT = "DOCUMENT"
     TECHNICAL = "TECHNICAL"
     LABEL = "LABEL"
@@ -103,8 +94,6 @@ class NEPQAItemType(str, Enum):
 
 
 class NEPQAItem(BaseModel):
-    """One row of the NEPQA Section 1.4 checklist."""
-
     model_config = ConfigDict(extra="forbid")
 
     clause_id: str = Field(description="e.g. '1.4.2.a' or '1.4.3.ix'")
@@ -183,8 +172,7 @@ class CriticFlag(BaseModel):
 
 
 class NEPQAChecklist(BaseModel):
-    """Wrapper for list[NEPQAItem] so structured-output APIs that prefer a top-level
-    object schema have one."""
+    """Wrapper so structured-output APIs that need a top-level object have one."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -196,3 +184,31 @@ class CriticReport(BaseModel):
 
     flags: list[CriticFlag] = Field(default_factory=list)
     ask_factory: list[str] = Field(default_factory=list)
+
+
+class DrafterProse(BaseModel):
+    """Four flat strings (no nested lists/tables) so Gemini's Schema proto
+    accepts them. Empty string = no synthesis possible; template skips that
+    block."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    cover_note: str = Field(
+        description=(
+            "4-6 sentences addressed to the Nepal import agent: what is in this "
+            "draft, which product was chosen, how to read it. Opens the document."
+        )
+    )
+    methodology_note: str = Field(
+        description=(
+            "3-5 sentences explaining how the draft was assembled — sources read, "
+            "what was reconciled, what was deferred. Addresses Ramesh's ask for "
+            "'a short note on how you approached it'."
+        )
+    )
+    gap_narrative: str = Field(
+        description="Plain-English grouping of partial/missing NEPQA items and what they imply."
+    )
+    mismatch_framing: str = Field(
+        description="Why the cross-source differences matter for THIS shipment."
+    )

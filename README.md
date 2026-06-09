@@ -25,7 +25,9 @@ The interesting twist (which I'm pretty sure is the trap Cantordust set on purpo
 
 ![graph](docs/graph.png)
 
-5 of the 11 nodes do LLM work. The other 6 (reconciler, mapper, drafter, render, the routers) are deterministic Python. The hot path that produces the final draft is mostly Python so it's testable and can't hallucinate.
+8 of the 13 registered nodes do LLM work. The other 5 (reconciler, mapper, the routers, load_pdfs) are deterministic Python. The drafter is hybrid: a Python markdown template carries every fact + (source: pdfN p.K) citation, and a small LLM call adds four short prose blocks (cover note to the import agent, methodology note, gap narrative, mismatch framing). The prose call is constrained — temperature 0, structured output, post-call guard that rejects any numeric value not present in the structured input — so the LLM can phrase but cannot fabricate. If the guard fires twice in a row, the drafter falls back to canned cover/methodology text and the deterministic core still ships.
+
+The drafter runs twice per pipeline. The first call renders the draft for the critic to review. After the critic loop terminates, a `drafter_final` node re-runs the drafter (same function, same deterministic filename) to pick up the critic's ask-the-factory list and surface it in §8 of the draft. The two passes overwrite the same `compliance_draft_<ts>.md` / `.pdf` / `agent_state_<ts>.json` so the final files on disk are always the post-critic versions.
 
 The variant detector wraps an LLM call but also runs a hard Python sanity check on the output: if the two records have disjoint model sets AND different family labels AND different phases, it forces a `DIFFERENT_FAMILY` verdict regardless of what the LLM said. Belt + suspenders.
 
@@ -90,33 +92,8 @@ The Streamlit version is the one to demo. It streams tokens live into each node 
 pytest tests/
 ```
 
-There are 18 tests covering schemas, reconciler severity logic, NEPQA coverage classification, the patch-extractor retry counter, all five variant-detector tools, the ReAct agent's commit path, and the fallback path when the agent fails to commit.
-
-## A few decisions worth flagging
-
-- **`FieldClaim` everywhere.** Every extracted value wears a `(value, source_doc, source_page, confidence)` jacket. The drafter only renders these as citations — it never paraphrases them or stamps in a citation that wasn't there. A wrong page number in the draft is immediately obvious.
-- **Two ProductRecords, not one merged record.** The PDFs are for different products. Forcing them into a single record would lose information and create false agreements.
-- **Self-correcting critic loop.** The critic isn't just a flag-printer. When it finds problems, a `patch_extractor` node re-extracts only the flagged fields and the loop reruns up to N times. A best-attempt safeguard keeps the lowest-flag-count draft in case a later iteration regresses.
-- **ReAct variant detector.** I started with a single-shot LLM call here, then upgraded to a `create_react_agent` with explicit tools — partly because it's a more honest answer to "how should the system reason about two records" and partly because the assessment is for a Generative AI & Agentic Systems role and I wanted at least one node that visibly thinks step-by-step.
-- **No vector store.** The total useful page count across all three docs is ~14 pages (with targeted slicing). RAG would be overkill — slicing is faster, cheaper, and traceable.
-
-## Things I deliberately left out
-
-- OCR fallback for scanned PDFs. All three input PDFs have real text; I checked.
-- Coverage for NEPQA sections other than 1.4 (modules, batteries, charge controllers, etc). Out of scope for an inverter shipment.
-- Per-model coverage. The Deye certificate covers 20 SKUs; I treat them as one family.
-- A real database for the IEC standards registry, which could let the agent validate cert numbers against a third source. Would be a nice MCP server.
+There are 42 tests covering schemas, reconciler severity logic, NEPQA coverage classification, the patch-extractor retry counter, all five variant-detector tools, the ReAct agent's commit path and fallback, the hybrid drafter's prose injection + digit-leak guard (rejection of fabricated numbers + fallback to empty prose), and the submission-grade template structure (10 sections, doc-control header, ask-factory §8, sign-off block, NEPQA-as-indicative-reference disclaimer).
 
 ## Demo
 
 Loom: _added after recording_
-
-## Form answers
-
-The Cantordust submission form answers are below — pasted here so they're versioned with the code.
-
-**Task**: Task 1 (China → Nepal)
-
-**Why this task**: It's the richer agentic surface. Two PDFs to reconcile, an explicit honest-mismatch problem to handle, and a real regulatory checklist to map against. Task 2 is mostly gap-marking with sparse inputs — interesting but it gives less to show.
-
-**Challenges and design choices**: The biggest one was that the two PDFs describe different product families from the same factory. A naive merge would have been wrong and the import agent would have caught it. I added a variant detector + human-in-loop step + a hard Python sanity override on top of the LLM verdict, so the agent surfaces the mismatch instead of hiding it. Provenance was the second big call — every value wraps in a FieldClaim with source doc, page, and confidence, and the drafter stamps those into every line of the final markdown. The third was the LLM/Python split: LLMs handle extraction, classification, and prose review; deterministic Python handles reconciliation, coverage mapping, drafting, and rendering. The Python core is unit-tested. After the base pipeline worked I added three agentic upgrades — a self-correcting critic loop, a ReAct variant detector with explicit tools, and optional LangSmith tracing — so the system genuinely reasons step-by-step at the variant decision and self-corrects when the critic finds problems. None of this was for show: each addition fixes a real failure mode I saw in earlier runs.

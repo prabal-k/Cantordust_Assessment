@@ -27,7 +27,6 @@ from pathlib import Path
 
 import streamlit as st
 
-from src.config import LANGSMITH_PROJECT, LANGSMITH_TRACING_ENABLED
 from src.nodes.human_in_loop import auto_choose_node
 from src.schemas import HumanChoice
 from src.streaming import (
@@ -50,8 +49,7 @@ from src.ui_nodes import (
 
 
 st.set_page_config(
-    page_title="Nepal Compliance Drafter — Cantordust Task 1",
-    page_icon="🧭",
+    page_title="Nepal Compliance Drafter",
     layout="wide",
 )
 
@@ -96,10 +94,6 @@ h3 {
 )
 
 st.title("Nepal Import Compliance Drafter")
-st.caption(
-    "Cantordust AI Engineer Assessment — Task 1 · LangGraph + Gemini/Groq · "
-    "live token streaming · honest reconciliation with provenance"
-)
 
 init_session_state()
 
@@ -108,17 +102,29 @@ init_session_state()
 
 with st.sidebar:
     st.header("Configuration")
-    if LANGSMITH_TRACING_ENABLED:
-        st.caption(f"🔵 LangSmith tracing ON — project `{LANGSMITH_PROJECT}`")
-    else:
-        st.caption("⚪ LangSmith disabled (set `LANGCHAIN_TRACING_V2=true`)")
     provider = st.radio(
         "LLM provider",
-        ["gemini", "groq"],
+        ["gemini", "groq", "openrouter"],
         index=0,
-        help="Switch backends; tokens stream from either provider.",
+        help=(
+            "Switch backends; tokens stream from any provider. "
+            "openrouter = OpenAI-API-compatible gateway w/ free Llama/DeepSeek "
+            "(set OPENROUTER_API_KEY + OPENROUTER_MODEL in .env)."
+        ),
     )
     os.environ["LLM_PROVIDER"] = provider
+    # Live-read so the caption reflects what get_llm() will actually use, not
+    # the radio default. Guards against stale-config-import bugs.
+    from src.llm import get_active_provider
+
+    _active = get_active_provider()
+    _model_env = {
+        "gemini": ("GEMINI_MODEL", "gemini-2.5-flash-lite"),
+        "groq": ("GROQ_MODEL", "llama-3.3-70b-versatile"),
+        "openrouter": ("OPENROUTER_MODEL", "qwen/qwen3-next-80b-a3b-instruct:free"),
+    }[_active]
+    _model = os.getenv(_model_env[0], _model_env[1])
+    st.caption(f"Active: **{_active}** · model `{_model}`")
 
     max_retries = st.slider(
         "Critic self-correction retries",
@@ -167,7 +173,7 @@ st.session_state.setdefault("phase_two_ran", False)
 action = st.container()
 with action:
     if st.session_state.phase == "idle":
-        run_clicked = st.button("▶ Run pipeline", type="primary", use_container_width=True)
+        run_clicked = st.button("Run pipeline", type="primary", use_container_width=True)
     else:
         run_clicked = False
         st.caption(f"Current phase: `{st.session_state.phase}`")
@@ -176,7 +182,7 @@ with action:
 # --- Render phase-one cards (only nodes that have already started) ------
 
 if st.session_state.phase != "idle":
-    st.subheader("⚡ Phase 1 — Extraction & variant detection")
+    st.subheader("Phase 1 — Extraction & variant detection")
     phase_one_cards = st.container()
     with phase_one_cards:
         from src.ui_nodes import PENDING
@@ -191,7 +197,7 @@ if st.session_state.phase != "idle":
 
 if run_clicked and st.session_state.phase == "idle":
     reset_node_status()
-    st.subheader("⚡ Phase 1 — Extraction & variant detection")
+    st.subheader("Phase 1 — Extraction & variant detection")
     phase_one_cards = st.container()
 
     state: dict = {
@@ -315,7 +321,7 @@ if st.session_state.phase in ("extracted", "choice_made", "done"):
 # --- Phase 2 execution --------------------------------------------------
 
 if st.session_state.phase in ("choice_made", "done"):
-    st.subheader("🧩 Phase 2 — Reconcile · Map · Draft · Critique")
+    st.subheader("Phase 2 — Reconcile · Map · Draft · Critique")
     phase_two_cards = st.container()
     if st.session_state.phase == "done":
         from src.ui_nodes import PENDING
@@ -375,11 +381,11 @@ if st.session_state.phase == "done":
     )
 
     tabs = st.tabs([
-        "📄 Draft preview",
-        "🧮 NEPQA coverage",
-        "🔀 Mismatches",
-        "🔎 Critic flags",
-        "📥 Downloads",
+        "Draft preview",
+        "NEPQA coverage",
+        "Mismatches",
+        "Critic flags",
+        "Downloads",
     ])
 
     with tabs[0]:
@@ -387,11 +393,8 @@ if st.session_state.phase == "done":
 
     with tabs[1]:
         for cov in state.get("coverage", []):
-            badge = {"COVERED": "🟢", "PARTIAL": "🟡", "MISSING": "🔴", "NOT_APPLICABLE": "⚪"}.get(
-                cov.status.value, "•"
-            )
             st.markdown(
-                f"{badge} **{cov.item.clause_id}** — {cov.item.requirement_text}  \n"
+                f"**{cov.item.clause_id}** — {cov.item.requirement_text}  \n"
                 f"_status_: `{cov.status.value}` · _gap_: {cov.gap_note or '—'}"
             )
 
@@ -430,7 +433,7 @@ if st.session_state.phase == "done":
         md_path = state.get("draft_md_path")
         if md_path and Path(md_path).exists():
             st.download_button(
-                "📄 Download markdown",
+                "Download markdown",
                 data=Path(md_path).read_bytes(),
                 file_name=Path(md_path).name,
                 mime="text/markdown",
@@ -438,10 +441,14 @@ if st.session_state.phase == "done":
         pdf_path = state.get("draft_pdf_path")
         if pdf_path and Path(pdf_path).exists():
             st.download_button(
-                "📕 Download PDF",
+                "Download PDF",
                 data=Path(pdf_path).read_bytes(),
                 file_name=Path(pdf_path).name,
                 mime="application/pdf",
             )
         else:
-            st.caption("PDF rendering skipped (WeasyPrint not installed). Markdown available.")
+            st.caption(
+                "PDF rendering skipped — both WeasyPrint and the PyMuPDF "
+                "fallback failed. Markdown is still available above. Re-run "
+                "the pipeline after a fresh start if you just upgraded."
+            )

@@ -1,22 +1,10 @@
-"""Node 5: classify the relationship between PDF1 and PDF2 records.
+"""Classify the relationship between PDF1 and PDF2 ProductRecords.
 
-Primary path: ReAct agent w/ 5 tools (compare_field, get_models,
-check_factory_match, check_certifications_overlap, commit_decision). The agent
-reasons step-by-step and commits its verdict via the terminal tool.
-
-Fallback path: original single-shot `invoke_structured(VariantDecision, ...)`
-call. Triggers when:
-  - the agent runs out of its tool-call budget without committing
-  - the agent's commit args fail VariantDecision validation
-  - any exception bubbles out of the agent run
-
-The hard Python sanity-check override (`_sanity_check_different`) runs on the
-final verdict in BOTH paths — belt + suspenders against an over-confident LLM
-silently picking SAME_PRODUCT.
-
-Streaming: the tool-call trace is emitted via the active `current_on_token`
-ContextVar after the agent completes, so the Streamlit card shows the agent's
-reasoning steps.
+Primary path: ReAct agent with 5 tools (compare_field, get_models,
+check_factory_match, check_certifications_overlap, commit_decision).
+Fallback: single-shot structured call if the agent never commits or its
+args fail validation. A Python sanity-check then overrides any verdict
+that contradicts disjoint-models + different-phase + different-family.
 """
 from __future__ import annotations
 
@@ -47,13 +35,7 @@ def _phase_value(record: ProductRecord) -> str | None:
 
 
 def _sanity_check_different(p1: ProductRecord, p2: ProductRecord) -> bool:
-    """True iff records are *clearly* different families.
-
-    All three must hold:
-      - model number sets fully disjoint
-      - family labels differ
-      - phase differs (single vs three)
-    """
+    """True iff model sets disjoint, family labels differ, phase differs."""
     if _model_set(p1) & _model_set(p2):
         return False
     if p1.family_label == p2.family_label:
@@ -65,16 +47,17 @@ def _sanity_check_different(p1: ProductRecord, p2: ProductRecord) -> bool:
 
 
 def _emit(text: str) -> None:
-    """Push a line into the active streaming buffer, if any."""
     cb = current_on_token.get()
     if cb is not None:
         cb(text)
 
 
 def _run_react_agent(p1: ProductRecord, p2: ProductRecord) -> VariantDecision | None:
-    """Returns a VariantDecision or None on failure (caller falls back)."""
+    """Stream the ReAct loop; break the moment `commit_decision` populates
+    the sink so the model can't re-run the evidence sequence after committing.
+    Returns None on failure (caller falls back to single-shot)."""
     from langgraph.prebuilt import create_react_agent
-    from langchain_core.messages import HumanMessage, SystemMessage
+    from langchain_core.messages import HumanMessage
 
     sink: list[dict] = []
     tools = build_variant_tools(p1, p2, sink)
@@ -82,43 +65,52 @@ def _run_react_agent(p1: ProductRecord, p2: ProductRecord) -> VariantDecision | 
 
     _emit(
         f"\n[variant_detector] Starting ReAct loop "
-        f"(max {VARIANT_AGENT_MAX_TOOL_CALLS} tool calls)\n"
+        f"(max {VARIANT_AGENT_MAX_TOOL_CALLS} tool calls, "
+        "early-break on commit)\n"
     )
 
     try:
         agent = create_react_agent(llm, tools=tools, prompt=VARIANT_AGENT_SYSTEM)
     except TypeError:
-        # langgraph < 0.2.50 used `state_modifier=`; tolerate both
+        # langgraph < 0.2.50 expects state_modifier=
         agent = create_react_agent(
             llm, tools=tools, state_modifier=VARIANT_AGENT_SYSTEM
         )
 
+    initial = {
+        "messages": [
+            HumanMessage(
+                content=variant_agent_user(
+                    p1.model_dump_json(),
+                    p2.model_dump_json(),
+                )
+            )
+        ]
+    }
+    config = {"recursion_limit": 2 * VARIANT_AGENT_MAX_TOOL_CALLS + 4}
+
+    final_messages: list = []
+    early_stop = False
     try:
-        result = agent.invoke(
-            {
-                "messages": [
-                    HumanMessage(
-                        content=variant_agent_user(
-                            p1.model_dump_json(indent=2),
-                            p2.model_dump_json(indent=2),
-                        )
-                    )
-                ]
-            },
-            config={"recursion_limit": 2 * VARIANT_AGENT_MAX_TOOL_CALLS + 4},
-        )
+        for update in agent.stream(initial, config=config, stream_mode="values"):
+            final_messages = update.get("messages", final_messages)
+            if sink:
+                early_stop = True
+                break
     except Exception as e:
         _emit(f"\n[agent fallback: {type(e).__name__}: {e}]\n")
         return None
 
-    # Emit a clean trace of every tool call + response into the streaming buffer
-    trace = format_tool_trace(result.get("messages", []))
+    trace = format_tool_trace(final_messages)
     if trace:
         _emit("\n" + trace + "\n")
 
     if not sink:
         _emit("\n[agent fallback: no commit_decision call]\n")
         return None
+
+    if early_stop:
+        _emit("\n[early-stop: commit_decision recorded, loop terminated]\n")
 
     try:
         decision = build_decision_from_sink(sink)
@@ -137,13 +129,12 @@ def _run_react_agent(p1: ProductRecord, p2: ProductRecord) -> VariantDecision | 
 
 
 def _fallback_single_shot(p1: ProductRecord, p2: ProductRecord) -> VariantDecision:
-    """Original single-shot path. Always returns a VariantDecision."""
     return invoke_structured(
         VariantDecision,
         VARIANT_DETECTOR_SYSTEM,
         variant_detector_user(
-            p1.model_dump_json(indent=2),
-            p2.model_dump_json(indent=2),
+            p1.model_dump_json(),
+            p2.model_dump_json(),
         ),
     )
 
@@ -156,7 +147,6 @@ def variant_detector_node(state: AgentState) -> AgentState:
     if decision is None:
         decision = _fallback_single_shot(p1, p2)
 
-    # Hard sanity override regardless of how we got here.
     if _sanity_check_different(p1, p2):
         if decision.relationship in (
             VariantRelationship.SAME_PRODUCT,

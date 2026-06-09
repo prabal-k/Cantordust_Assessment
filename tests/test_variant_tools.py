@@ -86,3 +86,30 @@ def test_commit_decision_then_build_from_sink(
 
 def test_build_decision_from_empty_sink_returns_none():
     assert build_decision_from_sink([]) is None
+
+
+def test_commit_decision_is_idempotent_second_call_no_op(
+    sample_record_pdf1, sample_record_pdf2
+):
+    """If the agent re-calls commit_decision after the first commit, the tool
+    must return a stop signal and NOT mutate the sink. Defense in depth against
+    the Gemini Flash re-commit loop the streaming early-break also fixes."""
+    sink: list[dict] = []
+    tools = build_variant_tools(sample_record_pdf1, sample_record_pdf2, sink)
+    commit = next(t for t in tools if t.name == "commit_decision")
+    args = {
+        "relationship": "DIFFERENT_FAMILY",
+        "reasoning": "First commit.",
+        "shared_attributes": ["factory"],
+        "distinguishing_attributes": ["phase"],
+        "requires_human_choice": True,
+    }
+    assert commit.invoke(args) == "committed"
+    assert len(sink) == 1
+
+    # Re-call with different args — must be a no-op.
+    args2 = dict(args, relationship="SAME_PRODUCT", reasoning="Second commit attempt.")
+    assert commit.invoke(args2) == "already_committed_stop"
+    assert len(sink) == 1
+    assert sink[0]["relationship"] == "DIFFERENT_FAMILY"
+    assert sink[0]["reasoning"] == "First commit."

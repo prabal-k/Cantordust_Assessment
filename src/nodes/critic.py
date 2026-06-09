@@ -1,15 +1,5 @@
-"""Node 10: self-review.
-
-Re-reads the draft against NEPQA source text. Flags:
-  - numeric claims not supported by NEPQA pages,
-  - low-confidence FieldClaims stated as fact,
-  - COVERED items with weak evidence.
-
-Also produces an "Ask the factory" punch list — concrete items SunBridge should
-chase before submitting to the import agent.
-
-Uses a separate LLM invocation at temperature=0 for tighter behavior.
-"""
+"""Critic node — re-reads the draft against NEPQA source text and produces
+flags + ask-factory list. Runs at temperature=0 for tighter behavior."""
 from __future__ import annotations
 
 import json
@@ -37,7 +27,7 @@ def critic_node(state: AgentState) -> AgentState:
     report = invoke_structured(
         CriticReport,
         CRITIC_SYSTEM,
-        critic_user(draft, nepqa_text, json.dumps(evidence, indent=2, default=str)),
+        critic_user(draft, nepqa_text, json.dumps(evidence, separators=(",", ":"), default=str)),
         temperature=CRITIC_TEMPERATURE,
     )
     return {"critic_flags": report.flags, "ask_factory_list": report.ask_factory}

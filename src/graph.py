@@ -1,11 +1,13 @@
 """LangGraph StateGraph wiring.
 
-Pipeline:
-    START → load_pdfs → [extract_pdf1, extract_pdf2, parse_nepqa] (parallel)
-          → variant_detector
-          → (conditional) human_in_loop OR auto_choose
-          → reconciler → nepqa_mapper → drafter → critic
-          → (conditional) patch_extractor → drafter → critic (loop) OR END
+START → load_pdfs → [extract_pdf1, extract_pdf2, parse_nepqa] (parallel)
+      → variant_detector → (human_in_loop | auto_choose)
+      → reconciler → nepqa_mapper → drafter → critic
+      → (patch_extractor → drafter → critic loop) OR drafter_final → END
+
+drafter_final is drafter_node called a second time so the critic's
+ask_factory_list lands in §8; the deterministic filename means the .md /
+.pdf / .json on disk are the post-critic versions.
 """
 from __future__ import annotations
 
@@ -32,8 +34,6 @@ from src.state import AgentState
 
 
 def should_retry(state: AgentState) -> Literal["patch_extractor", "end"]:
-    """Self-correction conditional. After critic, retry if there are flags and
-    we haven't exhausted the retry budget."""
     flags = state.get("critic_flags") or []
     retries = state.get("retry_count", 0)
     max_r = state.get("max_retries", 2)
@@ -57,20 +57,18 @@ def build_graph(use_checkpointer: bool = False):
     g.add_node("drafter", drafter_node)
     g.add_node("critic", critic_node)
     g.add_node("patch_extractor", patch_extractor_node)
+    g.add_node("drafter_final", drafter_node)
 
     g.add_edge(START, "load_pdfs")
 
-    # Fan-out: 3 parallel extraction nodes
     g.add_edge("load_pdfs", "extract_pdf1")
     g.add_edge("load_pdfs", "extract_pdf2")
     g.add_edge("load_pdfs", "parse_nepqa")
 
-    # Join at variant_detector (LangGraph waits for all 3)
     g.add_edge("extract_pdf1", "variant_detector")
     g.add_edge("extract_pdf2", "variant_detector")
     g.add_edge("parse_nepqa", "variant_detector")
 
-    # Conditional: human or auto
     g.add_conditional_edges(
         "variant_detector",
         needs_human_router,
@@ -86,16 +84,16 @@ def build_graph(use_checkpointer: bool = False):
     g.add_edge("nepqa_mapper", "drafter")
     g.add_edge("drafter", "critic")
 
-    # Self-correction conditional: loop back to patch_extractor or end
     g.add_conditional_edges(
         "critic",
         should_retry,
         {
             "patch_extractor": "patch_extractor",
-            "end": END,
+            "end": "drafter_final",
         },
     )
     g.add_edge("patch_extractor", "drafter")
+    g.add_edge("drafter_final", END)
 
     if use_checkpointer:
         return g.compile(

@@ -1,17 +1,52 @@
 """Streamlit UI helpers for streaming node cards.
 
-A single dict in `st.session_state.node_status` survives reruns; placeholders
-themselves are rebuilt every rerun (Streamlit objects don't survive). Each card
-shows: status icon + name + elapsed, description, optional token stream, final
-summary.
+`node_status` survives reruns; placeholders are recreated each rerun. Each
+card has a status icon, description, optional token stream (live tail +
+expandable full buffer / JSON tree on completion), and a final summary.
 """
 from __future__ import annotations
 
-from typing import Iterable
+import json
+import re
+from typing import Any, Iterable
 
 import streamlit as st
 
 from src.streaming import ALL_NODES, NODE_META
+
+
+_FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.MULTILINE)
+
+
+def _parse_json_if_possible(text: str) -> Any:
+    if not text:
+        return None
+    stripped = _FENCE_RE.sub("", text).strip()
+    if not stripped:
+        return None
+    try:
+        return json.loads(stripped)
+    except Exception:
+        pass
+    for opener, closer in (("{", "}"), ("[", "]")):
+        l = stripped.find(opener)
+        r = stripped.rfind(closer)
+        if l != -1 and r > l:
+            try:
+                return json.loads(stripped[l : r + 1])
+            except Exception:
+                continue
+    return None
+
+
+def _pretty_json(text: str) -> tuple[str, Any]:
+    parsed = _parse_json_if_possible(text)
+    if parsed is None:
+        return text, None
+    try:
+        return json.dumps(parsed, indent=2, ensure_ascii=False), parsed
+    except Exception:
+        return text, None
 
 
 # Status flags stored in session_state.node_status[node]["state"]
@@ -23,10 +58,10 @@ ERROR = "error"
 
 STATE_ICON = {
     PENDING: "·",
-    RUNNING: "🟢",
-    DONE: "✅",
-    SKIPPED: "⚪",
-    ERROR: "❌",
+    RUNNING: "▶",
+    DONE: "✓",
+    SKIPPED: "—",
+    ERROR: "✕",
 }
 
 
@@ -40,10 +75,12 @@ STATE_COLOR = {
 
 
 def init_session_state() -> None:
-    """Idempotently set up containers keyed by node name."""
     if "node_status" not in st.session_state:
         st.session_state.node_status = {
-            n: {"state": PENDING, "desc": "", "summary": "", "elapsed": None, "tokens": ""}
+            n: {
+                "state": PENDING, "desc": "", "summary": "", "elapsed": None,
+                "tokens": "", "tokens_parsed": None,
+            }
             for n in ALL_NODES
         }
     if "placeholders" not in st.session_state:
@@ -58,15 +95,7 @@ def reset_node_status() -> None:
 
 
 def render_node_card(node_key: str) -> dict:
-    """Create the placeholder containers for one node card. Returns the dict
-    of placeholders so the consumer can update them mid-stream.
-
-    For LLM nodes the token stream is shown in two surfaces:
-      - `tokens_preview`: a compact code block capped to the last ~5 lines /
-        400 chars. Always visible while the node is running.
-      - `tokens_full`: full buffer (last 6 KB) inside an `st.expander` that
-        is collapsed by default. The user clicks to drill down.
-    """
+    """Build the placeholder containers for one node card."""
     meta = NODE_META[node_key]
     icon = meta["icon"]
     with st.container(border=True):
@@ -90,8 +119,7 @@ def render_node_card(node_key: str) -> dict:
         "desc": desc,
         "tokens_preview": tokens_preview,
         "tokens_full": tokens_full,
-        # Back-compat alias so old code paths keep working.
-        "tokens": tokens_preview,
+        "tokens": tokens_preview,  # back-compat alias
         "summary": summary,
         "elapsed": elapsed,
         "is_llm": meta["is_llm"],
@@ -102,7 +130,6 @@ def render_node_card(node_key: str) -> dict:
 
 
 def _preview_text(text: str, max_lines: int = 5, max_chars: int = 400) -> str:
-    """Compact tail of a streaming buffer for the always-visible preview."""
     if not text:
         return ""
     lines = text.splitlines()
@@ -112,7 +139,6 @@ def _preview_text(text: str, max_lines: int = 5, max_chars: int = 400) -> str:
 
 
 def _paint_from_status(node_key: str, ph: dict) -> None:
-    """Render the persisted status into a freshly-created placeholder set."""
     status = st.session_state.node_status.get(node_key, {})
     state = status.get("state", PENDING)
     state_icon = STATE_ICON[state]
@@ -123,10 +149,16 @@ def _paint_from_status(node_key: str, ph: dict) -> None:
         ph["elapsed"].caption(f"{status['elapsed']:.1f}s")
     if ph.get("tokens_preview") is not None and status.get("tokens"):
         ph["tokens_preview"].code(
-            _preview_text(status["tokens"]), language="json"
+            _preview_text(status["tokens"]), language="json", wrap_lines=True
         )
     if ph.get("tokens_full") is not None and status.get("tokens"):
-        ph["tokens_full"].code(status["tokens"][-6000:], language="json")
+        parsed = status.get("tokens_parsed")
+        if state == DONE and parsed is not None:
+            ph["tokens_full"].json(parsed, expanded=False)
+        else:
+            ph["tokens_full"].code(
+                status["tokens"][-6000:], language="json", wrap_lines=True
+            )
     if status.get("summary"):
         if state == ERROR:
             ph["summary"].error(status["summary"])
@@ -137,12 +169,8 @@ def _paint_from_status(node_key: str, ph: dict) -> None:
 
 
 def render_all_cards(order: Iterable[str]) -> None:
-    """Render every card in `order` (used for phase one or phase two block)."""
     for n in order:
         render_node_card(n)
-
-
-# --- Live-update helpers used by the streaming consumer ------------------
 
 def on_node_start(
     node_key: str,
@@ -154,6 +182,7 @@ def on_node_start(
     status["state"] = RUNNING
     status["desc"] = desc
     status["tokens"] = ""
+    status["tokens_parsed"] = None
     status["summary"] = ""
     status["elapsed"] = None
     ph = st.session_state.placeholders.get(node_key)
@@ -171,8 +200,7 @@ def on_node_start(
 
 
 def on_node_token(node_key: str, text: str, *, throttle_chars: int = 80) -> None:
-    """Accumulate token text; repaint preview + full surfaces every
-    `throttle_chars` chars to keep the browser snappy."""
+    """Append text to the buffer; repaint every `throttle_chars` chars."""
     status = st.session_state.node_status[node_key]
     prev_len = len(status.get("tokens", ""))
     status["tokens"] = status.get("tokens", "") + text
@@ -183,9 +211,9 @@ def on_node_token(node_key: str, text: str, *, throttle_chars: int = 80) -> None
     if ph is None or ph.get("tokens_preview") is None:
         return
     full = status["tokens"]
-    ph["tokens_preview"].code(_preview_text(full), language="json")
+    ph["tokens_preview"].code(_preview_text(full), language="json", wrap_lines=True)
     if ph.get("tokens_full") is not None:
-        ph["tokens_full"].code(full[-6000:], language="json")
+        ph["tokens_full"].code(full[-6000:], language="json", wrap_lines=True)
 
 
 def on_node_done(node_key: str, summary: str, elapsed: float, *, final_buffer: str = "") -> None:
@@ -194,7 +222,9 @@ def on_node_done(node_key: str, summary: str, elapsed: float, *, final_buffer: s
     status["summary"] = summary
     status["elapsed"] = elapsed
     if final_buffer:
-        status["tokens"] = final_buffer
+        pretty, parsed = _pretty_json(final_buffer)
+        status["tokens"] = pretty
+        status["tokens_parsed"] = parsed
     ph = st.session_state.placeholders.get(node_key)
     if ph is None:
         return
@@ -204,10 +234,19 @@ def on_node_done(node_key: str, summary: str, elapsed: float, *, final_buffer: s
         unsafe_allow_html=True,
     )
     ph["elapsed"].caption(f"{elapsed:.1f}s")
-    if ph.get("tokens_preview") is not None and final_buffer:
-        ph["tokens_preview"].code(_preview_text(final_buffer), language="json")
-    if ph.get("tokens_full") is not None and final_buffer:
-        ph["tokens_full"].code(final_buffer[-6000:], language="json")
+    pretty = status.get("tokens", "")
+    parsed = status.get("tokens_parsed")
+    if ph.get("tokens_preview") is not None and pretty:
+        ph["tokens_preview"].code(
+            _preview_text(pretty), language="json", wrap_lines=True
+        )
+    if ph.get("tokens_full") is not None and pretty:
+        if parsed is not None:
+            ph["tokens_full"].json(parsed, expanded=False)
+        else:
+            ph["tokens_full"].code(
+                pretty[-6000:], language="json", wrap_lines=True
+            )
     ph["summary"].success(summary)
 
 

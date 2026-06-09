@@ -1,13 +1,5 @@
-"""ReAct tools for variant_detector.
-
-`build_variant_tools(p1, p2, sink)` returns the 5 LangChain tools bound to the
-two ProductRecords plus a mutable `sink` list. The agent calls them in any
-order; `commit_decision` is terminal and writes its args into the sink for the
-node to read after the agent finishes.
-
-The tools are pure functions over the two records — no LLM, no I/O. This makes
-them deterministic + unit-testable without mocking.
-"""
+"""ReAct tools for variant_detector. Pure functions over two ProductRecords +
+a shared sink that captures the commit_decision verdict."""
 from __future__ import annotations
 
 from typing import Any, Literal
@@ -16,11 +8,7 @@ from langchain_core.tools import BaseTool, tool
 
 from src.schemas import FieldClaim, ProductRecord
 
-
-# --- Helpers --------------------------------------------------------------
-
 def _resolve_field(record: ProductRecord, dotted: str) -> Any:
-    """Walk a dotted attribute path; return the leaf object or None."""
     obj: Any = record
     for part in dotted.split("."):
         obj = getattr(obj, part, None)
@@ -30,7 +18,6 @@ def _resolve_field(record: ProductRecord, dotted: str) -> Any:
 
 
 def _claim_value(obj: Any) -> str | None:
-    """Unwrap FieldClaim → str; pass plain scalars through."""
     if obj is None:
         return None
     if isinstance(obj, FieldClaim):
@@ -50,28 +37,17 @@ def _all_cert_standards(record: ProductRecord) -> list[str]:
         if isinstance(c.standard.value, str)
     ]
 
-
-# --- Tool factory ---------------------------------------------------------
-
 def build_variant_tools(
     p1: ProductRecord,
     p2: ProductRecord,
     sink: list[dict],
 ) -> list[BaseTool]:
-    """Return the 5 tools bound to these two records and to a shared sink for
-    `commit_decision` output."""
 
     @tool
     def compare_field(field_path: str) -> dict:
-        """Compare one field across PDF1 and PDF2 by dotted path.
-
-        field_path: dotted attribute path on ProductRecord. Examples:
-            "electrical.ac_voltage_v", "electrical.phase",
-            "electrical.rated_power_w", "mechanical.ip_rating",
-            "mechanical.topology", "manufacturer", "factory",
-            "family_label", "warranty_years".
-        Returns: {"pdf1_value": str|None, "pdf2_value": str|None, "match": bool,
-                   "path": str}.
+        """Compare one field across PDF1 and PDF2 by dotted path
+        (e.g. "electrical.phase", "factory", "family_label").
+        Returns {"pdf1_value", "pdf2_value", "match", "path"}.
         """
         v1 = _claim_value(_resolve_field(p1, field_path))
         v2 = _claim_value(_resolve_field(p2, field_path))
@@ -84,7 +60,7 @@ def build_variant_tools(
 
     @tool
     def get_models(pdf: Literal["pdf1", "pdf2"]) -> list[str]:
-        """Return the list of model SKU strings declared in the named record."""
+        """Return all model SKUs declared in the named record."""
         rec = p1 if pdf == "pdf1" else p2
         return [
             str(fc.value)
@@ -94,7 +70,7 @@ def build_variant_tools(
 
     @tool
     def check_factory_match() -> dict:
-        """Return {"pdf1_factory": str|None, "pdf2_factory": str|None, "match": bool}."""
+        """Return {"pdf1_factory", "pdf2_factory", "match"}."""
         f1 = _claim_value(p1.factory)
         f2 = _claim_value(p2.factory)
         match = (
@@ -106,8 +82,7 @@ def build_variant_tools(
 
     @tool
     def check_certifications_overlap() -> dict:
-        """Return {"shared": [...], "only_pdf1": [...], "only_pdf2": [...]} of
-        certification standard strings."""
+        """Return {"shared", "only_pdf1", "only_pdf2"} of cert standard strings."""
         s1 = set(_all_cert_standards(p1))
         s2 = set(_all_cert_standards(p2))
         return {
@@ -126,13 +101,13 @@ def build_variant_tools(
         distinguishing_attributes: list[str],
         requires_human_choice: bool,
     ) -> str:
-        """Record the FINAL verdict. Call this exactly once at the end.
-
-        relationship: one of SAME_PRODUCT, VARIANT, DIFFERENT_FAMILY,
-            OEM_SAME_FACTORY (uppercase, case-sensitive).
-        requires_human_choice: True when DIFFERENT_FAMILY or OEM_SAME_FACTORY.
-        Returns the literal string 'committed' on success.
+        """Record the FINAL verdict. Call exactly once. relationship is
+        uppercase. requires_human_choice=True for DIFFERENT_FAMILY and
+        OEM_SAME_FACTORY. Returns 'committed' on first call, then
+        'already_committed_stop' (sink stays untouched).
         """
+        if sink:
+            return "already_committed_stop"
         sink.append(
             {
                 "relationship": relationship,
@@ -154,7 +129,6 @@ def build_variant_tools(
 
 
 def build_decision_from_sink(sink: list[dict]):
-    """Construct a VariantDecision from the last commit in the sink."""
     from src.schemas import VariantDecision, VariantRelationship
 
     if not sink:
@@ -173,17 +147,12 @@ def build_decision_from_sink(sink: list[dict]):
 
 
 def format_tool_trace(messages: list) -> str:
-    """Convert the agent's final messages list into a readable text trace.
-
-    Format:  → tool_name(arg=...)
-             ← <result truncated to 240 chars>
-    """
+    """Render the agent's messages list as `→ tool(args)` / `← result` lines."""
     import json as _json
 
     lines: list[str] = []
     last_calls: dict[str, str] = {}
     for msg in messages:
-        # AIMessage with tool_calls
         tool_calls = getattr(msg, "tool_calls", None) or []
         for tc in tool_calls:
             name = tc.get("name") if isinstance(tc, dict) else getattr(tc, "name", "?")
@@ -200,7 +169,6 @@ def format_tool_trace(messages: list) -> str:
             lines.append(f"→ {name}({args_str})")
             if tcid:
                 last_calls[tcid] = name
-        # ToolMessage with the response
         if msg.__class__.__name__ == "ToolMessage":
             content = getattr(msg, "content", "")
             preview = str(content)

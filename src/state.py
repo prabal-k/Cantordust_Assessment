@@ -1,5 +1,4 @@
-"""LangGraph state container. TypedDict, total=False so nodes can write partial
-updates without re-declaring every key."""
+"""Shared LangGraph state container."""
 from __future__ import annotations
 
 from typing import Literal, Optional, TypedDict
@@ -50,6 +49,7 @@ class AgentState(TypedDict, total=False):
     draft_markdown: str
     draft_md_path: str
     draft_pdf_path: str
+    draft_safe_ts: str
     critic_flags: list[CriticFlag]
     ask_factory_list: list[str]
 

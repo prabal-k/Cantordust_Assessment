@@ -1,21 +1,19 @@
 """LLM provider abstraction.
 
-One env var (LLM_PROVIDER=gemini|groq) switches backend. Every node calls
-`invoke_structured` for typed extraction; tenacity wraps each call to absorb
-transient 429s and structured-output parse glitches.
+LLM_PROVIDER env var (gemini | groq | openrouter) switches backend.
+`invoke_structured` is the single typed entry-point used by every node;
+tenacity wraps it to absorb 429s and structured-output parse glitches.
 
-STREAMING SUPPORT
------------------
-When a caller (typically the Streamlit UI) wants live token visibility, it sets
-the `current_on_token` context-variable before invoking a node. Every
-`invoke_structured` call detects the ContextVar and switches from the buffered
-`.with_structured_output(schema).invoke(...)` path to a streaming raw-JSON path
-that emits chunks via the callback and parses the accumulated buffer at the end.
-Node code is untouched — the ContextVar is the dependency injection seam.
+Streaming: when a caller sets the `current_on_token` ContextVar (e.g. the
+Streamlit UI), invoke_structured switches from the buffered
+`with_structured_output` path to a raw-JSON streaming path that emits
+chunks via the callback and parses the buffer at the end. Node code is
+untouched.
 """
 from __future__ import annotations
 
 import json
+import os
 import re
 from contextvars import ContextVar
 from typing import Callable, Optional, Type, TypeVar
@@ -27,12 +25,11 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 
 from src.config import (
     DEFAULT_TEMPERATURE,
-    GEMINI_API_KEY,
     GEMINI_MODEL,
-    GROQ_API_KEY,
     GROQ_MODEL,
-    LLM_PROVIDER,
     MAX_RETRIES,
+    OPENROUTER_BASE_URL,
+    OPENROUTER_MODEL,
 )
 
 T = TypeVar("T", bound=BaseModel)
@@ -46,9 +43,16 @@ current_on_token: ContextVar[Optional[Callable[[str], None]]] = ContextVar(
 
 
 def get_llm(temperature: float = DEFAULT_TEMPERATURE) -> BaseChatModel:
-    """Return a chat model based on LLM_PROVIDER env var."""
-    if LLM_PROVIDER == "gemini":
-        if not GEMINI_API_KEY:
+    """Build a chat model from the live LLM_PROVIDER env var.
+
+    Env vars are read live (not cached at import) so the Streamlit radio can
+    switch providers mid-session by writing os.environ before invoking.
+    """
+    provider = os.getenv("LLM_PROVIDER", "gemini").lower()
+
+    if provider == "gemini":
+        gemini_key = os.getenv("GEMINI_API_KEY", "")
+        if not gemini_key:
             raise RuntimeError(
                 "GEMINI_API_KEY missing. Set it in .env "
                 "(free key: https://aistudio.google.com/apikey)"
@@ -58,11 +62,12 @@ def get_llm(temperature: float = DEFAULT_TEMPERATURE) -> BaseChatModel:
         return ChatGoogleGenerativeAI(
             model=GEMINI_MODEL,
             temperature=temperature,
-            google_api_key=GEMINI_API_KEY,
+            google_api_key=gemini_key,
         )
 
-    if LLM_PROVIDER == "groq":
-        if not GROQ_API_KEY:
+    if provider == "groq":
+        groq_key = os.getenv("GROQ_API_KEY", "")
+        if not groq_key:
             raise RuntimeError(
                 "GROQ_API_KEY missing. Set it in .env "
                 "(free key: https://console.groq.com/keys)"
@@ -72,12 +77,39 @@ def get_llm(temperature: float = DEFAULT_TEMPERATURE) -> BaseChatModel:
         return ChatGroq(
             model=GROQ_MODEL,
             temperature=temperature,
-            groq_api_key=GROQ_API_KEY,
+            groq_api_key=groq_key,
+        )
+
+    if provider == "openrouter":
+        or_key = os.getenv("OPENROUTER_API_KEY", "")
+        if not or_key:
+            raise RuntimeError(
+                "OPENROUTER_API_KEY missing. Set it in .env "
+                "(free key: https://openrouter.ai/keys). "
+                "Pick a :free model in OPENROUTER_MODEL — see "
+                "https://openrouter.ai/models?max_price=0"
+            )
+        from langchain_openai import ChatOpenAI
+
+        return ChatOpenAI(
+            model=os.getenv("OPENROUTER_MODEL", OPENROUTER_MODEL),
+            temperature=temperature,
+            api_key=or_key,
+            base_url=os.getenv("OPENROUTER_BASE_URL", OPENROUTER_BASE_URL),
+            default_headers={
+                "HTTP-Referer": "https://github.com/cantordust-task1",
+                "X-Title": "Nepal Import Compliance Drafter",
+            },
         )
 
     raise ValueError(
-        f"Unknown LLM_PROVIDER: {LLM_PROVIDER!r}. Use 'gemini' or 'groq'."
+        f"Unknown LLM_PROVIDER: {provider!r}. "
+        "Use 'gemini', 'groq', or 'openrouter'."
     )
+
+
+def get_active_provider() -> str:
+    return os.getenv("LLM_PROVIDER", "gemini").lower()
 
 
 _CODE_FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.MULTILINE)
@@ -88,7 +120,6 @@ def _strip_code_fences(s: str) -> str:
 
 
 def _extract_json_blob(s: str) -> str:
-    """Last-ditch: take the widest balanced { ... } slice."""
     start = s.find("{")
     end = s.rfind("}")
     if start == -1 or end == -1 or end <= start:
@@ -97,13 +128,6 @@ def _extract_json_blob(s: str) -> str:
 
 
 def _extract_delta(chunk) -> str:
-    """Pull a displayable text delta from a streaming AIMessageChunk.
-
-    For both Gemini and Groq, regular `.content` carries the JSON body when the
-    model is asked for raw JSON. If the provider routes the response through
-    tool_call_chunks instead (rare for our explicit JSON-only prompt), we fall
-    back to that.
-    """
     content = getattr(chunk, "content", "") or ""
     if content:
         return content
@@ -120,19 +144,11 @@ def _stream_into_schema(
     user_prompt: str,
     on_token: Callable[[str], None],
 ) -> T:
-    """Stream a raw JSON response, push tokens to `on_token`, parse into schema.
-
-    Adds a strict JSON-only suffix to the system prompt so the model emits
-    parseable JSON without prose or fences. Falls back to a code-fence strip
-    and a widest-balanced-brace slice if the buffer doesn't parse cleanly.
-    """
     from src.prompts import JSON_ONLY_GUARD
 
     sys2 = system_prompt + JSON_ONLY_GUARD.format(
-        json_schema=json.dumps(schema.model_json_schema(), indent=2)
+        json_schema=json.dumps(schema.model_json_schema(), separators=(",", ":"))
     )
-
-    # Reset signal so the UI can clear stale token buffer on retry.
     on_token("\n")
 
     buffer: list[str] = []
@@ -164,13 +180,8 @@ def invoke_structured(
     temperature: float = DEFAULT_TEMPERATURE,
     on_token: Optional[Callable[[str], None]] = None,
 ) -> T:
-    """Force LLM to return a validated instance of `schema`.
-
-    If `on_token` is None, the active `current_on_token` ContextVar is used.
-    When a callback is in play, switches to the streaming raw-JSON path so the
-    caller can render tokens live. Otherwise uses the original buffered
-    `with_structured_output` path.
-    """
+    """Return a validated instance of `schema`. Streams via on_token (or the
+    current_on_token ContextVar) when set, else uses with_structured_output."""
     on_token = on_token or current_on_token.get()
     llm = get_llm(temperature=temperature)
 
@@ -194,7 +205,6 @@ def invoke_text(
     user_prompt: str,
     temperature: float = DEFAULT_TEMPERATURE,
 ) -> str:
-    """Plain-text call for the drafter node (markdown body generation)."""
     llm = get_llm(temperature=temperature)
     result = llm.invoke(
         [

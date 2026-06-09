@@ -1,8 +1,6 @@
-"""Markdown → PDF renderer.
-
-Primary backend: WeasyPrint (needs GTK3 on Windows).
-Fallback: skip PDF generation gracefully if WeasyPrint unavailable.
-"""
+"""Markdown → PDF. Tries WeasyPrint first (needs GTK3 on Windows), then
+PyMuPDF Story API (pure-Python). Same CSS feeds both; PyMuPDF understands
+a subset, so styling degrades gracefully."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -17,6 +15,17 @@ def _try_weasyprint():
         return HTML, CSS
     except (ImportError, OSError):
         return None, None
+
+
+def _try_pymupdf():
+    try:
+        import pymupdf  # type: ignore
+
+        if not hasattr(pymupdf, "Story"):
+            return None
+        return pymupdf
+    except ImportError:
+        return None
 
 
 _CSS = """
@@ -36,15 +45,56 @@ blockquote { border-left: 3px solid #c2410c; padding: 4px 10px; color: #4a5568; 
 """
 
 
-def markdown_to_pdf(md_text: str, out_pdf: Path) -> bool:
-    """Render markdown to PDF. Returns True on success, False if WeasyPrint missing."""
-    HTML, CSS = _try_weasyprint()
-    if HTML is None:
+def _markdown_to_html(md_text: str) -> str:
+    body = md.markdown(md_text, extensions=["tables", "fenced_code"])
+    return (
+        "<html><head><meta charset='utf-8'><style>"
+        f"{_CSS}"
+        "</style></head><body>"
+        f"{body}"
+        "</body></html>"
+    )
+
+
+def _render_pymupdf(md_text: str, out_pdf: Path) -> bool:
+    pymupdf = _try_pymupdf()
+    if pymupdf is None:
         return False
-    html_body = md.markdown(md_text, extensions=["tables", "fenced_code"])
-    html_doc = f"<html><head><meta charset='utf-8'></head><body>{html_body}</body></html>"
-    HTML(string=html_doc).write_pdf(str(out_pdf), stylesheets=[CSS(string=_CSS)])
-    return True
+    html_doc = _markdown_to_html(md_text)
+    try:
+        story = pymupdf.Story(html=html_doc, user_css=_CSS)
+        writer = pymupdf.DocumentWriter(str(out_pdf))
+        page_w, page_h = pymupdf.paper_size("a4")
+        media_box = pymupdf.Rect(0, 0, page_w, page_h)
+        margin = 36
+        where = pymupdf.Rect(
+            margin, margin, page_w - margin, page_h - margin
+        )
+        more = 1
+        while more:
+            dev = writer.begin_page(media_box)
+            more, _ = story.place(where)
+            story.draw(dev)
+            writer.end_page()
+        writer.close()
+        return True
+    except Exception:
+        return False
+
+
+def markdown_to_pdf(md_text: str, out_pdf: Path) -> bool:
+    """Render markdown to PDF. Returns True on success."""
+    HTML, CSS = _try_weasyprint()
+    if HTML is not None:
+        try:
+            html_doc = _markdown_to_html(md_text)
+            HTML(string=html_doc).write_pdf(
+                str(out_pdf), stylesheets=[CSS(string=_CSS)]
+            )
+            return True
+        except Exception:
+            pass
+    return _render_pymupdf(md_text, out_pdf)
 
 
 def save_markdown(md_text: str, out_md: Path) -> None:

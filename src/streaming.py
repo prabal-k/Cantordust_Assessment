@@ -1,17 +1,9 @@
-"""Streaming + per-node progress wiring.
+"""Per-node streaming runner consumed by Streamlit.
 
-Wraps each node call with start/done events and pipes LLM token deltas through
-the `current_on_token` ContextVar in `src.llm`. Streamlit consumes the event
-stream and renders one card per node.
-
-Two generators model the human-in-loop split:
-  - stream_phase_one: load_pdfs → extract_pdf1 → extract_pdf2 → parse_nepqa
-                      → variant_detector → (auto_choose if no human needed)
-  - stream_phase_two: reconciler → nepqa_mapper → drafter → critic
-
-The "parallel" trio (extract_pdf1/2 + parse_nepqa) runs sequentially here so we
-get clean visible token streams without thread races; LangGraph still fan-outs
-for the production CLI path.
+stream_phase_one runs up through variant_detector; stream_phase_two runs
+the post-human nodes plus the critic / patch_extractor retry loop and
+the final drafter pass. The extraction trio runs sequentially here to
+keep token streams legible — LangGraph still fans out in the CLI path.
 """
 from __future__ import annotations
 
@@ -32,17 +24,11 @@ from src.nodes.patch_extractor import patch_extractor_node
 from src.nodes.reconciler import reconciler_node
 from src.nodes.variant_detector import variant_detector_node
 
-
-# --- Event ---------------------------------------------------------------
-
 @dataclass
 class Event:
     type: str  # "node_start" | "token" | "node_done" | "node_skipped" | "error" | "phase_done"
     node: str
     payload: dict[str, Any] = field(default_factory=dict)
-
-
-# --- NODE_META: per-node descriptions + summaries ------------------------
 
 def _safe(fn: Callable[[dict], str], state: dict) -> str:
     try:
@@ -164,13 +150,30 @@ def _done_nepqa_mapper(s):
 
 
 def _running_drafter(s):
-    return "Rendering markdown + PDF compliance draft to outputs/"
+    return "Generating prose blocks + rendering markdown + PDF to outputs/"
 
 
 def _done_drafter(s):
     md = s.get("draft_markdown") or ""
     md_path = s.get("draft_md_path") or "—"
     return f"Draft {len(md)} chars → {md_path.split(chr(92))[-1] if md_path else '—'}"
+
+
+def _running_drafter_final(s):
+    asks = len(s.get("ask_factory_list") or [])
+    return (
+        f"Final draft pass: injecting {asks} ask-factory item(s) into §8 + "
+        "overwriting outputs/"
+    )
+
+
+def _done_drafter_final(s):
+    md = s.get("draft_markdown") or ""
+    md_path = s.get("draft_md_path") or "—"
+    return (
+        f"Final draft {len(md)} chars → "
+        f"{md_path.split(chr(92))[-1] if md_path else '—'}"
+    )
 
 
 def _running_critic(s):
@@ -216,76 +219,82 @@ def _done_patch_extractor(s):
 
 NODE_META: dict[str, dict] = {
     "load_pdfs": {
-        "icon": "📄",
+        "icon": "",
         "is_llm": False,
         "running": _running_load_pdfs,
         "done": _done_load_pdfs,
     },
     "extract_pdf1": {
-        "icon": "🔍",
+        "icon": "",
         "is_llm": True,
         "running": _running_extract_pdf1,
         "done": _done_extract("pdf1_record"),
     },
     "extract_pdf2": {
-        "icon": "🔍",
+        "icon": "",
         "is_llm": True,
         "running": _running_extract_pdf2,
         "done": _done_extract("pdf2_record"),
     },
     "parse_nepqa": {
-        "icon": "📋",
+        "icon": "",
         "is_llm": True,
         "running": _running_parse_nepqa,
         "done": _done_parse_nepqa,
     },
     "variant_detector": {
-        "icon": "🔀",
+        "icon": "",
         "is_llm": True,
         "running": _running_variant_detector,
         "done": _done_variant_detector,
     },
     "human_in_loop": {
-        "icon": "🙋",
+        "icon": "",
         "is_llm": False,
         "running": _running_human,
         "done": _done_chosen,
     },
     "auto_choose": {
-        "icon": "🤖",
+        "icon": "",
         "is_llm": False,
         "running": _running_auto_choose,
         "done": _done_chosen,
     },
     "reconciler": {
-        "icon": "🔗",
+        "icon": "",
         "is_llm": False,
         "running": _running_reconciler,
         "done": _done_reconciler,
     },
     "nepqa_mapper": {
-        "icon": "🗺",
+        "icon": "",
         "is_llm": False,
         "running": _running_nepqa_mapper,
         "done": _done_nepqa_mapper,
     },
     "drafter": {
-        "icon": "📝",
-        "is_llm": False,
+        "icon": "",
+        "is_llm": True,
         "running": _running_drafter,
         "done": _done_drafter,
     },
     "critic": {
-        "icon": "🔎",
+        "icon": "",
         "is_llm": True,
         "running": _running_critic,
         "done": _done_critic,
     },
     "patch_extractor": {
-        "icon": "🔧",
+        "icon": "",
         "is_llm": True,
         "running": _running_patch_extractor,
         "done": _done_patch_extractor,
+    },
+    "drafter_final": {
+        "icon": "",
+        "is_llm": True,
+        "running": _running_drafter_final,
+        "done": _done_drafter_final,
     },
 }
 
@@ -305,6 +314,7 @@ PHASE_TWO_ORDER = [
     "drafter",
     "critic",
     "patch_extractor",
+    "drafter_final",
 ]
 
 ALL_NODES = PHASE_ONE_ORDER + ["human_in_loop", "auto_choose"] + PHASE_TWO_ORDER
@@ -321,18 +331,11 @@ _NODE_FNS: dict[str, Callable[[dict], dict]] = {
     "drafter": drafter_node,
     "critic": critic_node,
     "patch_extractor": patch_extractor_node,
+    "drafter_final": drafter_node,
 }
 
-
-# --- Generator runners ---------------------------------------------------
-
 def _run_node(node_key: str, state: dict) -> Iterator[Event]:
-    """Run one node, yielding node_start, optional tokens, node_done/error.
-
-    For nodes that participate in the self-correction loop (critic,
-    patch_extractor, drafter), the node_start payload includes retry_attempt
-    and max_retries so the Streamlit UI can render a "Retry N/M" header.
-    """
+    """Yield node_start, token events, node_done/error for one node."""
     meta = NODE_META[node_key]
     fn = _NODE_FNS[node_key]
     desc = _safe(meta["running"], state)
@@ -345,8 +348,6 @@ def _run_node(node_key: str, state: dict) -> Iterator[Event]:
     t0 = time.perf_counter()
 
     if meta["is_llm"]:
-        # Pipe streamed tokens through the ContextVar so the underlying
-        # invoke_structured call hits its streaming branch.
         buf: list[str] = []
         deferred: list[Event] = []
 
@@ -365,7 +366,6 @@ def _run_node(node_key: str, state: dict) -> Iterator[Event]:
         finally:
             current_on_token.reset(token)
 
-        # Drain any buffered token events first, then the done event.
         yield from deferred
         state.update(update)
         yield Event(
@@ -379,7 +379,6 @@ def _run_node(node_key: str, state: dict) -> Iterator[Event]:
         )
         return
 
-    # Pure Python node
     try:
         update = fn(state)
     except Exception as e:
@@ -397,15 +396,12 @@ def _run_node(node_key: str, state: dict) -> Iterator[Event]:
 
 
 def stream_phase_one(state: dict) -> Iterator[Event]:
-    """Up through variant_detector. Stops before the human-in-loop break."""
     for key in PHASE_ONE_ORDER:
         yield from _run_node(key, state)
     yield Event("phase_done", "phase_one")
 
 
 def _snapshot_attempt(state: dict) -> dict:
-    """Return a copy of the artifacts we may need to restore if a later attempt
-    regresses."""
     return {
         "flag_count": len(state.get("critic_flags") or []),
         "draft_markdown": state.get("draft_markdown", ""),
@@ -418,7 +414,6 @@ def _snapshot_attempt(state: dict) -> dict:
 
 
 def _restore_attempt(state: dict, attempt: dict) -> None:
-    """Restore a snapshotted attempt into state."""
     state["draft_markdown"] = attempt["draft_markdown"]
     state["draft_md_path"] = attempt["draft_md_path"]
     state["draft_pdf_path"] = attempt["draft_pdf_path"]
@@ -428,15 +423,10 @@ def _restore_attempt(state: dict, attempt: dict) -> None:
 
 
 def stream_phase_two(state: dict) -> Iterator[Event]:
-    """After the human radio. Runs reconciler → mapper → drafter → critic, then
-    enters the self-correction loop:
-
-      while critic flags > 0 AND retry_count < max_retries:
-          patch_extractor → drafter → critic
-
-    Best-attempt safeguard: tracks the lowest-flag-count attempt across all
-    iterations and restores it at the end if a later attempt regressed.
-    """
+    """Reconciler → mapper → drafter → critic, then the self-correction loop
+    (patch_extractor → drafter → critic up to max_retries), then a final
+    drafter pass. Tracks the lowest-flag attempt and restores it if a later
+    iteration regressed."""
     yield from _run_node("reconciler", state)
     yield from _run_node("nepqa_mapper", state)
     yield from _run_node("drafter", state)
@@ -457,7 +447,6 @@ def stream_phase_two(state: dict) -> Iterator[Event]:
             best = _snapshot_attempt(state)
             state["best_attempt"] = {"flag_count": best["flag_count"]}
 
-    # Restore best attempt if the current state regressed
     final_flag_count = len(state.get("critic_flags") or [])
     if best["flag_count"] < final_flag_count:
         _restore_attempt(state, best)
@@ -472,5 +461,7 @@ def stream_phase_two(state: dict) -> Iterator[Event]:
                 "elapsed": 0.0,
             },
         )
+
+    yield from _run_node("drafter_final", state)
 
     yield Event("phase_done", "phase_two")
